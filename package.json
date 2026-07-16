@@ -1,0 +1,48 @@
+
+{
+  "name": "rle-google-fotos-backup-tool",
+  "version": "1.0.0",
+  "description": "RLE Google Fotos Backup Tool – lädt Google Fotos herunter und korrigiert EXIF-Daten",
+  "main": "main.cjs",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "electron:dev": "concurrently -k \"npm run dev\" \"electron .\"",
+    "electron:build": "npm run build && electron-builder --win"
+  },
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "piexifjs": "^1.0.6",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "adm-zip": "^0.5.10"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "@vitejs/plugin-react": "^4.2.1",
+    "concurrently": "^8.2.2",
+    "electron": "^29.1.0",
+    "electron-builder": "^24.13.3",
+    "typescript": "^5.3.3",
+    "vite": "^5.1.4"
+  },
+  "build": {
+    "appId": "com.rle.googlefotosbackup",
+    "productName": "RLE Google Fotos Backup Tool",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "main.cjs",
+      "preload.cjs"
+    ],
+    "win": {
+      "target": ["dir", "portable", "nsis"],
+      "icon": "public/icon.ico"
+    }
+  }
+}

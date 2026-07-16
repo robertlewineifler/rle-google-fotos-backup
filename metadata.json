@@ -1,0 +1,5 @@
+{
+  "name": "G-Photos Web Crawler",
+  "description": "Browser-basierter Downloader für Google Fotos. Sortiert nach Alben und korrigiert EXIF-Daten basierend auf der Web-Ansicht.",
+  "requestFramePermissions": []
+}
