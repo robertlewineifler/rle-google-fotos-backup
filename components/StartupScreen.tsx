@@ -1,5 +1,6 @@
 
 import React from 'react';
+import iconPath from '../assets/icon.png';
 
 interface StartupScreenProps {
     onLoadDatabase: () => void;
@@ -10,7 +11,7 @@ export const StartupScreen: React.FC<StartupScreenProps> = ({ onLoadDatabase, on
     return (
         <div className="h-screen w-screen bg-slate-900 text-slate-100 flex items-center justify-center p-8 select-none">
             <div className="bg-slate-800 p-8 rounded-xl shadow-2xl border border-slate-700 max-w-lg w-full text-center">
-                 <img src="dist/icon.ico" alt="Logo" className="w-16 h-16 mx-auto mb-4" />
+                 <img src={iconPath} alt="Logo" className="w-16 h-16 mx-auto mb-4" />
                  <h1 className="text-2xl font-bold text-blue-400 mb-2">RLE Google Fotos Backup</h1>
                  <p className="text-slate-400 mb-8 text-sm">Wähle eine Datenbank-Datei (gphotos_db.json) um zu beginnen.</p>
                  
@@ -39,7 +40,7 @@ export const StartupScreen: React.FC<StartupScreenProps> = ({ onLoadDatabase, on
                  </div>
                  
                  <div className="mt-8 text-xs text-slate-500">
-                    Version 1.0.0 • Alle Daten bleiben lokal.
+                    Version 1.0.1 • Alle Daten bleiben lokal.
                  </div>
             </div>
         </div>
