@@ -1,8 +1,8 @@
 
 {
-  "name": "rle-google-fotos-backup-tool",
+  "name": "rle-google-fotos-backup",
   "version": "1.0.0",
-  "description": "RLE Google Fotos Backup Tool – lädt Google Fotos herunter und korrigiert EXIF-Daten",
+  "description": "RLE Google Fotos Backup – lädt Google Fotos herunter und korrigiert EXIF-Daten",
   "main": "main.cjs",
   "type": "module",
   "scripts": {
@@ -31,7 +31,7 @@
   },
   "build": {
     "appId": "com.rle.googlefotosbackup",
-    "productName": "RLE Google Fotos Backup Tool",
+    "productName": "RLE Google Fotos Backup",
     "directories": {
       "output": "release"
     },

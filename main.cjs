@@ -48,7 +48,7 @@ function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1400,
     height: 1000,
-    title: 'RLE Google Fotos Backup Tool',
+    title: 'RLE Google Fotos Backup',
     icon: path.join(__dirname, 'public', 'icon.ico'),
     autoHideMenuBar: true,
     webPreferences: {
