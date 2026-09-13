@@ -6,7 +6,7 @@ import { parseGoogleDateString, parseExifDateToDate, getIsoDateString } from './
 import * as Crawler from './logic/crawlerActions';
 import * as DbUtils from './logic/databaseUtils';
 import { StartupScreen } from './components/StartupScreen';
-import { IntegrityReportModal, CorrectionModal, RenameModal } from './components/ActionModals';
+import { IntegrityReportModal, CorrectionModal, RenameModal, AlbumDownloadModal } from './components/ActionModals';
 import { ScanHeatmapModal } from './components/ScanHeatmap';
 
 const App: React.FC = () => {
@@ -53,12 +53,15 @@ const App: React.FC = () => {
   const [showIntegrityModal, setShowIntegrityModal] = useState(false);
   const [showHeatmapModal, setShowHeatmapModal] = useState(false);
   const [showRenameModal, setShowRenameModal] = useState(false); // NEU
+  const [showAlbumModal, setShowAlbumModal] = useState(false);
 
   // --- Refs ---
   const webviewRef = useRef<any>(null);
   const tableContainerRef = useRef<HTMLDivElement>(null);
   const logContainerRef = useRef<HTMLDivElement>(null);
   const isWalkingRef = useRef(false);
+  const isAlbumModeRef = useRef(false);
+  const albumTargetPathRef = useRef<string | null>(null);
   
   // --- Computed Stats ---
   // Zählt, an wie vielen Tagen das Programm tatsächlich benutzt wurde (Scan-Aktivität)
@@ -77,7 +80,7 @@ const App: React.FC = () => {
   }, [processedCount, isInitialized, showIntegrityModal]); // Recalc on updates
 
   // --- Helper Functions ---
-  const addLog = (message: string, type: 'info' | 'error' | 'success' | 'debug' | 'warning' = 'info') => {
+  const addLog = (message: string, type: 'info' | 'error' | 'success' | 'debug' | 'warning' | 'album' = 'info') => {
     // Check if resetting to avoid state updates on unmounted/reset components
     if (isResettingRef.current) return;
 
@@ -89,6 +92,7 @@ const App: React.FC = () => {
         type === 'error' || 
         type === 'success' || 
         type === 'warning' ||
+        type === 'album' ||
         message.includes('Backup') || 
         message.includes('Datenbank') ||
         message.includes('Bereinigung') ||
@@ -164,42 +168,57 @@ const App: React.FC = () => {
                   const originalExifDate = parseExifDateToDate(result.originalExifDate || "");
                   const finalDate = new Date(result.finalDateTimestamp || Date.now());
 
-                  let isMatch = true;
-                  if (originalExifDate) {
-                      const diff = Math.abs(finalDate.getTime() - originalExifDate.getTime());
-                      if (diff > 60000) isMatch = false; 
-                  }
-                  
-                  if (!isMatch && originalExifDate) {
-                      addLog(`Datum korrigiert: ${result.filename} (Original: ${originalExifDate.toLocaleString()} -> Web: ${finalDate.toLocaleString()})`, 'warning');
-                  }
+                  if (isAlbumModeRef.current) {
+                      // ALBUM-MODUS: Keine DB-Aktualisierung, nur Log
+                      const albumEntry: DownloadedFile = {
+                          id: result.id, originalName: result.originalName, fileName: result.filename,
+                          webDate: finalDate, fileDate: finalDate, originalExifDate: originalExifDate,
+                          isMatch: true, wasAdjusted: true, type: (isVideo ? 'video' : 'image') as 'image' | 'video', status: 'Album', path: result.path
+                      };
+                      setDownloadedFiles(prev => [...prev, albumEntry].slice(-100));
+                      addLog(`[ALBUM] Download fertig: ${result.filename}`, 'album');
+                  } else {
+                      let isMatch = true;
+                      if (originalExifDate) {
+                          const diff = Math.abs(finalDate.getTime() - originalExifDate.getTime());
+                          if (diff > 60000) isMatch = false; 
+                      }
+                      
+                      if (!isMatch && originalExifDate) {
+                          addLog(`Datum korrigiert: ${result.filename} (Original: ${originalExifDate.toLocaleString()} -> Web: ${finalDate.toLocaleString()})`, 'warning');
+                      }
 
-                  const entry: DownloadedFile = {
-                      id: result.id, originalName: result.originalName, fileName: result.filename,
-                      webDate: finalDate, fileDate: finalDate, originalExifDate: originalExifDate,
-                      isMatch: isMatch, wasAdjusted: true, type: isVideo ? 'video' : 'image', status: isMatch ? 'OK' : 'Manuell', path: result.path
-                  };
-                  
-                  setDownloadedFiles(prev => [...prev, entry].slice(-100));
-                  
-                  // DB UPDATE: Jetzt mit originalName
-                  dbRef.current.files[result.id] = {
-                      filename: result.filename, 
-                      originalName: result.originalName, // NEU: Originalname speichern für spätere Bereinigung
-                      timestamp: finalDate.getTime(), 
-                      savedAt: Date.now(),
-                      downloadedAt: Date.now(), 
-                      scannedAt: Date.now(), 
-                      originalDate: result.originalExifDate, 
-                      hash: result.hash,
-                      // WICHTIG: Integrity Status NICHT auf 'ok' setzen, sondern offen lassen (undefined).
-                      // Damit gilt die Datei als "ungeprüft" im Dashboard und kann validiert werden.
-                  };
+                      const entry: DownloadedFile = {
+                          id: result.id, originalName: result.originalName, fileName: result.filename,
+                          webDate: finalDate, fileDate: finalDate, originalExifDate: originalExifDate,
+                          isMatch: isMatch, wasAdjusted: true, type: isVideo ? 'video' : 'image', status: isMatch ? 'OK' : 'Manuell', path: result.path
+                      };
+                      
+                      setDownloadedFiles(prev => [...prev, entry].slice(-100));
+                      
+                      // DB UPDATE: Jetzt mit originalName
+                      dbRef.current.files[result.id] = {
+                          filename: result.filename, 
+                          originalName: result.originalName, // NEU: Originalname speichern für spätere Bereinigung
+                          timestamp: finalDate.getTime(), 
+                          savedAt: Date.now(),
+                          downloadedAt: Date.now(), 
+                          scannedAt: Date.now(), 
+                          originalDate: result.originalExifDate, 
+                          hash: result.hash,
+                          // WICHTIG: Integrity Status NICHT auf 'ok' setzen, sondern offen lassen (undefined).
+                          // Damit gilt die Datei als "ungeprüft" im Dashboard und kann validiert werden.
+                      };
 
-                  setProcessedCount(prev => prev + 1);
-                  addLog(`Download fertig: ${result.filename}`, 'success');
+                      setProcessedCount(prev => prev + 1);
+                      addLog(`Download fertig: ${result.filename}`, 'success');
+                  }
               } else {
-                  addLog(`Fehler beim Download (${result.id}): ${result.error}`, 'error');
+                  if (isAlbumModeRef.current) {
+                      addLog(`[ALBUM] Fehler beim Download (${result.id}): ${result.error}`, 'album');
+                  } else {
+                      addLog(`Fehler beim Download (${result.id}): ${result.error}`, 'error');
+                  }
               }
           });
 
@@ -646,6 +665,7 @@ const App: React.FC = () => {
       setShowCorrectionModal(false);
       setShowIntegrityModal(false);
       setShowRenameModal(false); 
+      setShowAlbumModal(false);
       setRenamableFiles([]); 
       
       // 3. Clear Refs
@@ -655,6 +675,8 @@ const App: React.FC = () => {
       setActiveDownloadsCount(0);
       setActiveProgress({});
       pendingStartResolvers.current.clear();
+      isAlbumModeRef.current = false;
+      albumTargetPathRef.current = null;
       
       // 4. Force Cleanup of Webview State if possible
       setIsInitialized(false);
@@ -675,14 +697,15 @@ const App: React.FC = () => {
   };
 
   // --- CORE CRAWLER LOGIC ---
-  const initiateDownloadAsync = async (info: any, savePath: string): Promise<void> => {
+  const initiateDownloadAsync = async (info: any, savePath: string, isAlbumDownload: boolean = false): Promise<void> => {
       const webDate = parseGoogleDateString(info.dateStr || "");
       if (isNaN(webDate.getTime())) return;
       
       await window.electron.prepareDownload({
           id: info.id,
           targetDir: savePath,
-          dateTimestamp: webDate.getTime()
+          dateTimestamp: webDate.getTime(),
+          flatStructure: isAlbumDownload
       });
 
       const startPromise = new Promise<void>((resolve) => {
@@ -701,11 +724,34 @@ const App: React.FC = () => {
       
       activeDownloadsRef.current += 1;
       setActiveDownloadsCount(activeDownloadsRef.current);
-      processedIdsRef.current.add(info.id);
+      if (!isAlbumDownload) {
+          processedIdsRef.current.add(info.id);
+      }
+  };
+
+  const getUrlContextType = (url: string): 'main' | 'album' | 'share' | 'search' => {
+      if (url.includes('/search/')) return 'search';
+      if (url.includes('/album/')) return 'album';
+      if (url.includes('/share/')) return 'share';
+      if (url.includes('/photo/')) return 'main';
+      return 'main';
   };
 
   const handleSingleDownload = async () => {
       if (!webviewRef.current || !exportPath) return addLog('Fehler: Kein Zielordner oder Webview nicht bereit.', 'error');
+      
+      const url = webviewRef.current.getURL();
+      const context = getUrlContextType(url);
+
+      if (context === 'search') {
+          return addLog('FEHLER: Downloads aus der Suche sind deaktiviert.', 'error');
+      }
+
+      if (context === 'album' || context === 'share') {
+          setShowAlbumModal(true);
+          return;
+      }
+
       addLog("Analysiere aktuelles Bild...", 'info');
 
       try {
@@ -744,7 +790,7 @@ const App: React.FC = () => {
           }
 
           if (needsDownload) {
-              await initiateDownloadAsync(result, exportPath);
+              await initiateDownloadAsync(result, exportPath, false);
               addLog(`Download für ${result.id} angefordert.`, 'info');
           }
 
@@ -837,9 +883,30 @@ const App: React.FC = () => {
 
   const startWalkthrough = async () => {
     if (!webviewRef.current || !exportPath) return addLog('Fehler: Kein Zielordner.', 'error');
-    if (webviewRef.current.getURL().includes('/album/')) return addLog("FEHLER: Downloads aus Alben deaktiviert.", 'error');
-    if (!webviewRef.current.getURL().includes('/photo/')) return addLog('Bitte öffne zuerst ein Bild!', 'error');
 
+    const url = webviewRef.current.getURL();
+    const context = getUrlContextType(url);
+
+    if (context === 'search') {
+      return addLog('FEHLER: Downloads aus der Suche sind deaktiviert.', 'error');
+    }
+
+    if (context === 'album' || context === 'share') {
+      setShowAlbumModal(true);
+      return;
+    }
+
+    if (!url.includes('/photo/')) {
+      return addLog('Bitte öffne zuerst ein Bild!', 'error');
+    }
+
+    await runBackupSession(false);
+  };
+
+  const runBackupSession = async (isAlbumMode: boolean) => {
+    if (!webviewRef.current || !exportPath) return;
+
+    isAlbumModeRef.current = isAlbumMode;
     isWalkingRef.current = true;
     setIsWalking(true);
     setProcessedCount(0);
@@ -848,17 +915,30 @@ const App: React.FC = () => {
     minDateEncountered.current = null;
     maxDateEncountered.current = null;
     isResettingRef.current = false;
-    addLog('Starte Turbo-Backup (Parallel)...', 'info');
-    
+
+    if (isAlbumMode) {
+      addLog(`[ALBUM] Starte separaten Album-Download nach ${albumTargetPathRef.current}...`, 'album');
+    } else {
+      addLog('Starte Turbo-Backup (Parallel)...', 'info');
+    }
+
     await Crawler.toggleInfoPanel(webviewRef.current);
     await sleep(1000);
+
+    const targetPath = isAlbumMode ? albumTargetPathRef.current : exportPath;
+    if (!targetPath) {
+      addLog('FEHLER: Kein Zielordner für den Download festgelegt.', 'error');
+      isWalkingRef.current = false;
+      setIsWalking(false);
+      return;
+    }
 
     let consecutiveErrors = 0;
     let currentId = await Crawler.extractIdFromUrl(webviewRef.current);
     let lastSaveTime = Date.now();
     let batchCounter = 0; 
-    let lastDayIdentifier: string | null = null; // NEU: Tracking für Tageswechsel ("YYYY-MM-DD")
-    let firstDayIdentifier: string | null = null; // NEU: Verhindert, dass der erste (unvollständige) Tag als fertig markiert wird
+    let lastDayIdentifier: string | null = null;
+    let firstDayIdentifier: string | null = null;
 
     while (isWalkingRef.current) {
         if (batchCounter >= 1000) {
@@ -870,7 +950,7 @@ const App: React.FC = () => {
                      await sleep(200);
                  }
              }
-             await saveDatabase();
+             if (!isAlbumMode) await saveDatabase();
              await sleep(1500);
              batchCounter = 0;
              setBatchCount(0);
@@ -885,7 +965,7 @@ const App: React.FC = () => {
         if (!isWalkingRef.current) break;
 
         try {
-            if (Date.now() - lastSaveTime > 30000) {
+            if (!isAlbumMode && Date.now() - lastSaveTime > 30000) {
                 await saveDatabase();
                 lastSaveTime = Date.now();
             }
@@ -897,7 +977,7 @@ const App: React.FC = () => {
             while (attempts < 5) { 
                 if (!isWalkingRef.current) break;
                 
-                result = await safeExtractInfo(); // NEU: Timeout Wrapper
+                result = await safeExtractInfo();
                 
                 const validDate = result && !isNaN(parseGoogleDateString(result.dateStr || "").getTime());
                 if (validDate) break;
@@ -917,11 +997,11 @@ const App: React.FC = () => {
                 addLog(`Datum nicht lesbar für ${currentId}. Versuche Reload (L/R)...`, 'warning');
                 
                 await Crawler.navigatePrevious(webviewRef.current);
-                await sleep(500); // Kürzere Wartezeit
+                await sleep(500);
                 if (!isWalkingRef.current) break;
                 await Crawler.navigateNext(webviewRef.current);
                 await Crawler.killVideoPlayers(webviewRef.current);
-                await sleep(250); // Nur kurz warten für Transition, dann übernimmt die Hauptschleife das Polling
+                await sleep(250);
                 
                 currentId = await Crawler.extractIdFromUrl(webviewRef.current);
                 
@@ -941,121 +1021,111 @@ const App: React.FC = () => {
             
             consecutiveErrors = 0;
 
-            // NEU: Tageswechsel-Erkennung & Scan-Log
-            // Wir erzeugen einen Schlüssel YYYY-MM-DD
+            // NEU: Tageswechsel-Erkennung & Scan-Log (nur im Hauptbackup)
             const currentDayIdentifier = getIsoDateString(webDate);
             
-            // Initialisierung des allerersten Tages der Session
             if (firstDayIdentifier === null) {
                 firstDayIdentifier = currentDayIdentifier;
             }
             
-            // Wenn wir den Tag gewechselt haben (z.B. von "2023-12-05" auf "2023-12-04"),
-            // dann ist der alte Tag (lastDayIdentifier) nun fertig gescannt.
-            if (lastDayIdentifier !== null && lastDayIdentifier !== currentDayIdentifier) {
-                
-                // WICHTIG: Den ERSTEN Tag der Session nicht als fertig markieren, da wir mitten im Tag gestartet sein könnten.
+            if (!isAlbumMode && lastDayIdentifier !== null && lastDayIdentifier !== currentDayIdentifier) {
                 if (lastDayIdentifier !== firstDayIdentifier) {
                     if (!dbRef.current.scannedDays) dbRef.current.scannedDays = {};
                     dbRef.current.scannedDays[lastDayIdentifier] = Date.now();
                     
                     addLog(`📅 Scan-Log: ${lastDayIdentifier} erledigt.`, 'success');
-                    await saveDatabase(); // Sofort speichern
-                    batchCounter = 0;     // Batch Reset, da gespeichert
+                    await saveDatabase();
+                    batchCounter = 0;
                     setBatchCount(0);
                 } else {
-                    // Optionales Log zur Info
                     addLog(`📅 Scan-Log: ${lastDayIdentifier} übersprungen (Start-Tag unsicher).`, 'info');
                 }
             }
             lastDayIdentifier = currentDayIdentifier;
 
-            updateRangeTracking(webTimestamp);
-            sessionSeenIds.current.add(result.id);
+            if (!isAlbumMode) {
+                updateRangeTracking(webTimestamp);
+                sessionSeenIds.current.add(result.id);
+            }
 
-            // --- 3. Download Entscheidung & Metadaten Update ---
+            // --- 3. Download Entscheidung ---
             let needsDownload = false;
-            let dbDirty = false;
 
-            if (processedIdsRef.current.has(result.id)) {
-                const existingEntry = dbRef.current.files[result.id];
-                if (existingEntry) {
-                    // NEU: Prüfe, ob die Datei physisch existiert
-                    const fileExists = await window.electron.checkFileExists({
-                        basePath: exportPath,
-                        filename: existingEntry.filename,
-                        timestamp: existingEntry.timestamp
-                    });
+            if (isAlbumMode) {
+                // Im Album-Modus immer herunterladen, keine DB-Prüfung
+                needsDownload = true;
+            } else {
+                let dbDirty = false;
 
-                    if (!fileExists) {
-                        addLog(`⚠️ Datei fehlt lokal: ${existingEntry.filename} -> Download`, 'warning');
-                        needsDownload = true;
-                    } else {
-                        // Datei existiert -> Prüfe Metadaten
-                        let metaUpdated = false;
+                if (processedIdsRef.current.has(result.id)) {
+                    const existingEntry = dbRef.current.files[result.id];
+                    if (existingEntry) {
+                        const fileExists = await window.electron.checkFileExists({
+                            basePath: exportPath,
+                            filename: existingEntry.filename,
+                            timestamp: existingEntry.timestamp
+                        });
 
-                        // A: Missing-Status aufheben
-                        if (existingEntry.missingSince) {
-                             delete existingEntry.missingSince; 
-                             metaUpdated = true;
-                             dbDirty = true;
-                             addLog(`✅ Status korrigiert: ${existingEntry.filename} wiedergefunden.`, 'success');
-                        }
+                        if (!fileExists) {
+                            addLog(`⚠️ Datei fehlt lokal: ${existingEntry.filename} -> Download`, 'warning');
+                            needsDownload = true;
+                        } else {
+                            let metaUpdated = false;
 
-                        // B: Original Name aktualisieren (falls im Crawl gefunden und in DB fehlend/anders)
-                        // Wir nehmen an, dass 'potentialFilename' aus dem Crawler der Titel aus der Info-Sidebar ist.
-                        if (result.potentialFilename && (!existingEntry.originalName || existingEntry.originalName !== result.potentialFilename)) {
-                             const oldNameLog = existingEntry.originalName || "(keiner)";
-                             existingEntry.originalName = result.potentialFilename;
-                             metaUpdated = true;
-                             dbDirty = true;
-                             addLog(`📝 Metadaten: Original-Name aktualisiert (${oldNameLog} -> ${result.potentialFilename})`, 'info');
-                        }
+                            if (existingEntry.missingSince) {
+                                 delete existingEntry.missingSince; 
+                                 metaUpdated = true;
+                                 dbDirty = true;
+                                 addLog(`✅ Status korrigiert: ${existingEntry.filename} wiedergefunden.`, 'success');
+                            }
 
-                        // C: Datum korrigieren UND Datei verschieben
-                        if (Math.abs(existingEntry.timestamp - webTimestamp) > 60000) {
-                            const oldDateStr = new Date(existingEntry.timestamp).toLocaleString();
-                            const newDateStr = new Date(webTimestamp).toLocaleString();
-                            addLog(`📂 Verschiebe Datei: "${existingEntry.filename}"...`, 'warning');
-                            
-                            const moveResult = await window.electron.moveAndUpdateFile({
-                                basePath: exportPath,
-                                oldFilename: existingEntry.filename,
-                                oldTimestamp: existingEntry.timestamp,
-                                newTimestamp: webTimestamp
-                            });
+                            if (result.potentialFilename && (!existingEntry.originalName || existingEntry.originalName !== result.potentialFilename)) {
+                                 const oldNameLog = existingEntry.originalName || "(keiner)";
+                                 existingEntry.originalName = result.potentialFilename;
+                                 metaUpdated = true;
+                                 dbDirty = true;
+                                 addLog(`📝 Metadaten: Original-Name aktualisiert (${oldNameLog} -> ${result.potentialFilename})`, 'info');
+                            }
 
-                            if (moveResult.success) {
-                                existingEntry.timestamp = webTimestamp;
-                                if (moveResult.newFilename) existingEntry.filename = moveResult.newFilename;
-                                metaUpdated = true;
-                                dbDirty = true;
-                                addLog(`✅ Verschoben: ${oldDateStr} -> ${newDateStr}. Pfad angepasst.`, 'success');
-                            } else {
-                                addLog(`❌ Fehler beim Verschieben: ${moveResult.error}`, 'error');
+                            if (Math.abs(existingEntry.timestamp - webTimestamp) > 60000) {
+                                const oldDateStr = new Date(existingEntry.timestamp).toLocaleString();
+                                const newDateStr = new Date(webTimestamp).toLocaleString();
+                                addLog(`📂 Verschiebe Datei: "${existingEntry.filename}"...`, 'warning');
+                                
+                                const moveResult = await window.electron.moveAndUpdateFile({
+                                    basePath: exportPath,
+                                    oldFilename: existingEntry.filename,
+                                    oldTimestamp: existingEntry.timestamp,
+                                    newTimestamp: webTimestamp
+                                });
+
+                                if (moveResult.success) {
+                                    existingEntry.timestamp = webTimestamp;
+                                    if (moveResult.newFilename) existingEntry.filename = moveResult.newFilename;
+                                    metaUpdated = true;
+                                    dbDirty = true;
+                                    addLog(`✅ Verschoben: ${oldDateStr} -> ${newDateStr}. Pfad angepasst.`, 'success');
+                                } else {
+                                    addLog(`❌ Fehler beim Verschieben: ${moveResult.error}`, 'error');
+                                }
+                            }
+
+                            existingEntry.scannedAt = Date.now();
+
+                            if (!metaUpdated) {
+                                addLog(`Bekannt: ${existingEntry.filename} (Übersprungen)`, 'debug');
                             }
                         }
-
-                        existingEntry.scannedAt = Date.now();
-
-                        // D: Log für bekannte Dateien (nur wenn keine relevante Änderung war, als 'Bekannt')
-                        if (!metaUpdated) {
-                            addLog(`Bekannt: ${existingEntry.filename} (Übersprungen)`, 'debug');
-                        }
+                    } else {
+                        needsDownload = true;
                     }
                 } else {
                     needsDownload = true;
                 }
-            } else {
-                needsDownload = true;
-            }
-            
-            if (dbDirty) {
-                // Optional: Sofort speichern bei wichtigen Änderungen oder Debouncen lassen
             }
 
             if (needsDownload) {
-                await initiateDownloadAsync(result, exportPath);
+                await initiateDownloadAsync(result, targetPath, isAlbumMode);
             }
             
             if (!isWalkingRef.current) break;
@@ -1085,7 +1155,16 @@ const App: React.FC = () => {
             await sleep(500);
         }
     }
-    finishBackupSession();
+
+    if (isAlbumMode) {
+        setIsWalking(false);
+        isAlbumModeRef.current = false;
+        albumTargetPathRef.current = null;
+        addLog('[ALBUM] Album-Download beendet.', 'album');
+        pendingStartResolvers.current.clear();
+    } else {
+        finishBackupSession();
+    }
   };
 
   if (!isInitialized) return <StartupScreen onLoadDatabase={handleInitLoadDatabase} onNewDatabase={handleInitNewDatabase} />;
@@ -1135,6 +1214,20 @@ const App: React.FC = () => {
       {/* MISSING FILES MODAL REMOVED - now handled by CorrectionModal */}
       {showRenameModal && <RenameModal candidates={renamableFiles} onClose={() => setShowRenameModal(false)} onExecute={executeRenameFiles} />}
       {showHeatmapModal && <ScanHeatmapModal scannedDays={scannedDays} files={dbRef.current.files} onClose={() => setShowHeatmapModal(false)} />}
+      {showAlbumModal && (
+          <AlbumDownloadModal
+              isOpen={showAlbumModal}
+              onClose={() => setShowAlbumModal(false)}
+              onStart={(folderName) => {
+                  if (!exportPath) return;
+                  const albumPath = exportPath + '\\Alben\\' + folderName;
+                  albumTargetPathRef.current = albumPath;
+                  setShowAlbumModal(false);
+                  runBackupSession(true);
+              }}
+              basePath={exportPath}
+          />
+      )}
       
       <div className="flex-1 bg-white relative border-b-4 border-slate-700 min-h-[40%]">
         <webview ref={webviewRef} src="https://photos.google.com" className="w-full h-full" 
@@ -1212,8 +1305,14 @@ const App: React.FC = () => {
         <div className="hidden md:flex w-full md:w-1/4 p-3 border-r border-slate-700 flex-col min-w-0 opacity-50 hover:opacity-100 transition-opacity">
              <div className="flex justify-between items-center mb-1"><h3 className="font-bold text-slate-400 uppercase text-xs tracking-wider">Wichtige Ereignisse</h3></div>
              <div className="flex-1 bg-black/50 rounded border border-slate-700 p-2 overflow-y-auto font-mono text-[10px] scrollbar-thin" ref={logContainerRef}>
-                {logs.map((l, i) => (
-                    <div key={i} className={`mb-1 px-1 rounded ${l.type === 'error' ? 'bg-red-900/30 text-red-300' : l.type === 'success' ? 'bg-green-900/30 text-green-300' : l.type === 'warning' ? 'bg-amber-900/30 text-amber-300' : 'text-slate-300'}`}>
+                 {logs.map((l, i) => (
+                    <div key={i} className={`mb-1 px-1 rounded ${
+                        l.type === 'error' ? 'bg-red-900/30 text-red-300' : 
+                        l.type === 'success' ? 'bg-green-900/30 text-green-300' : 
+                        l.type === 'warning' ? 'bg-amber-900/30 text-amber-300' : 
+                        l.type === 'album' ? 'bg-purple-900/30 text-purple-300 border-l-2 border-purple-500' : 
+                        'text-slate-300'
+                    }`}>
                         <span className="opacity-50 mr-2">{new Date(l.timestamp).toLocaleTimeString()}</span>{l.message}
                     </div>
                 ))}

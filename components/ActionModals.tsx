@@ -651,3 +651,97 @@ export const RenameModal: React.FC<RenameModalProps> = ({ candidates, onClose, o
         </div>
     );
 };
+
+interface AlbumDownloadModalProps {
+    isOpen: boolean;
+    onClose: () => void;
+    onStart: (folderName: string) => void;
+    basePath: string | null;
+}
+
+export const AlbumDownloadModal: React.FC<AlbumDownloadModalProps> = ({ isOpen, onClose, onStart, basePath }) => {
+    const [folderName, setFolderName] = useState('');
+    const [error, setError] = useState<string | null>(null);
+
+    useEffect(() => {
+        if (isOpen) {
+            setFolderName('');
+            setError(null);
+        }
+    }, [isOpen]);
+
+    if (!isOpen) return null;
+
+    const sanitizeName = (name: string): string => {
+        return name.replace(/[\\/:*?"<>|]/g, '_').trim();
+    };
+
+    const handleStart = () => {
+        const sanitized = sanitizeName(folderName);
+        if (!sanitized) {
+            setError('Bitte gib einen Ordnernamen ein.');
+            return;
+        }
+        setError(null);
+        onStart(sanitized);
+    };
+
+    const fullPath = basePath ? `${basePath}\\Alben\\${sanitizeName(folderName || 'MeinAlbum')}` : '';
+
+    return (
+        <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-[90] p-8">
+            <div className="bg-slate-800 border border-slate-600 rounded-lg shadow-2xl max-w-lg w-full flex flex-col">
+                <div className="p-4 border-b border-slate-700 flex justify-between items-center bg-purple-900/20">
+                    <h3 className="text-lg font-bold text-purple-400">Album-Download</h3>
+                </div>
+
+                <div className="p-6 flex flex-col gap-4 bg-slate-900/50">
+                    <p className="text-sm text-slate-300">
+                        Du befindest dich in einem Album oder einer geteilten Sammlung.
+                        Downloads hier werden <strong>getrennt vom Hauptbackup</strong> in einen eigenen Ordner geladen
+                        und nicht in die Datenbank übernommen.
+                    </p>
+
+                    <div>
+                        <label className="block text-xs text-slate-400 font-bold uppercase mb-1">
+                            Ordnername
+                        </label>
+                        <input
+                            type="text"
+                            value={folderName}
+                            onChange={(e) => {
+                                setFolderName(e.target.value);
+                                setError(null);
+                            }}
+                            placeholder="z.B. Urlaub_2024"
+                            className="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-white text-sm focus:outline-none focus:border-purple-500"
+                            autoFocus
+                        />
+                        {error && <div className="text-red-400 text-xs mt-1">{error}</div>}
+                    </div>
+
+                    {basePath && (
+                        <div className="text-xs text-slate-500 font-mono break-all">
+                            Ziel: {fullPath}
+                        </div>
+                    )}
+                </div>
+
+                <div className="p-4 border-t border-slate-700 flex justify-end gap-3 bg-slate-800">
+                    <button
+                        onClick={onClose}
+                        className="bg-slate-600 hover:bg-slate-500 text-white px-4 py-2 rounded text-sm"
+                    >
+                        Abbrechen
+                    </button>
+                    <button
+                        onClick={handleStart}
+                        className="bg-purple-600 hover:bg-purple-500 text-white px-4 py-2 rounded text-sm font-bold shadow"
+                    >
+                        Download starten
+                    </button>
+                </div>
+            </div>
+        </div>
+    );
+};

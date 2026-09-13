@@ -30,7 +30,7 @@ export interface GoogleMediaItem {
 export interface ProcessingLog {
   timestamp: number;
   message: string;
-  type: 'info' | 'error' | 'success' | 'debug' | 'warning';
+  type: 'info' | 'error' | 'success' | 'debug' | 'warning' | 'album';
 }
 
 export interface DownloadedFile {
@@ -61,6 +61,7 @@ export interface DownloadConfig {
     id: string; // NEU: ID zum Tracking
     targetDir: string;
     dateTimestamp: number; // Für fs.utimes
+    flatStructure?: boolean; // NEU: Keine Jahr/Monat-Unterordner (für Album-Downloads)
 }
 
 export interface DownloadResult {

@@ -41,7 +41,8 @@ let nextDownloadConfig = {
     active: false,
     id: '',
     targetDir: '',
-    dateTimestamp: 0
+    dateTimestamp: 0,
+    flatStructure: false
 };
 
 function createWindow() {
@@ -86,10 +87,15 @@ function createWindow() {
     const originalNameRaw = item.getFilename();
     const webDate = new Date(config.dateTimestamp);
     
-    // PFAD-LOGIK: Immer YYYY/MM
-    const year = webDate.getFullYear().toString();
-    const month = (webDate.getMonth() + 1).toString().padStart(2, '0');
-    const targetSubFolder = path.join(config.targetDir, year, month);
+    // PFAD-LOGIK: Normalerweise YYYY/MM, bei Album-Downloads flach
+    let targetSubFolder;
+    if (config.flatStructure) {
+        targetSubFolder = config.targetDir;
+    } else {
+        const year = webDate.getFullYear().toString();
+        const month = (webDate.getMonth() + 1).toString().padStart(2, '0');
+        targetSubFolder = path.join(config.targetDir, year, month);
+    }
     
     if (!fs.existsSync(targetSubFolder)){
         fs.mkdirSync(targetSubFolder, { recursive: true });
@@ -645,7 +651,7 @@ ipcMain.handle('clear-session-cache', async () => {
 });
 
 ipcMain.handle('prepare-download', async (event, config) => {
-    nextDownloadConfig = { active: true, id: config.id, targetDir: config.targetDir, dateTimestamp: config.dateTimestamp };
+    nextDownloadConfig = { active: true, id: config.id, targetDir: config.targetDir, dateTimestamp: config.dateTimestamp, flatStructure: config.flatStructure || false };
     return true;
 });
 
