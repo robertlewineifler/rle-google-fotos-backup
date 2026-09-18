@@ -1,6 +1,7 @@
 
 import React from 'react';
 import iconPath from '../assets/icon.png';
+import packageJson from '../package.json';
 
 interface StartupScreenProps {
     onLoadDatabase: () => void;
@@ -40,7 +41,7 @@ export const StartupScreen: React.FC<StartupScreenProps> = ({ onLoadDatabase, on
                  </div>
                  
                  <div className="mt-8 text-xs text-slate-500">
-                    Version 1.0.1 • Alle Daten bleiben lokal.
+                    Version {packageJson.version} • Alle Daten bleiben lokal.
                  </div>
             </div>
         </div>

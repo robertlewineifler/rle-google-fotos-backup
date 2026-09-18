@@ -696,11 +696,26 @@ export const AlbumDownloadModal: React.FC<AlbumDownloadModalProps> = ({ isOpen, 
                 </div>
 
                 <div className="p-6 flex flex-col gap-4 bg-slate-900/50">
-                    <p className="text-sm text-slate-300">
+                    <p className="text-sm text-slate-300 font-bold">
                         Du befindest dich in einem Album oder einer geteilten Sammlung.
-                        Downloads hier werden <strong>getrennt vom Hauptbackup</strong> in einen eigenen Ordner geladen
-                        und nicht in die Datenbank übernommen.
                     </p>
+
+                    <div className="bg-amber-900/20 border border-amber-600/50 rounded p-3 text-xs text-slate-300 flex flex-col gap-2">
+                        <div className="font-bold text-amber-300">Wichtiger Hinweis</div>
+                        <p>
+                            Der Album-Download ist eine <strong className="text-amber-200">getrennte Funktion</strong> neben
+                            dem eigentlichen Backup und ersetzt dieses nicht:
+                        </p>
+                        <ul className="list-disc list-inside flex flex-col gap-1 text-slate-300">
+                            <li>Die Fotos werden in einen eigenen Ordner geladen: <span className="font-mono text-amber-200">…\Alben\&lt;Name&gt;\</span></li>
+                            <li>Sie werden <strong>nicht in die Datenbank</strong> aufgenommen</li>
+                            <li>Sie erscheinen <strong>nicht in der Backup-Statistik</strong></li>
+                            <li><strong>Duplikate sind beabsichtigt</strong> und kein Fehler – der Album-Ordner kann später unabhängig vom Backup gelöscht werden</li>
+                        </ul>
+                        <p className="text-slate-400">
+                            Das eigentliche Backup solltest du weiterhin aus der Hauptbibliothek durchführen.
+                        </p>
+                    </div>
 
                     <div>
                         <label className="block text-xs text-slate-400 font-bold uppercase mb-1">
