@@ -16,6 +16,7 @@ contextBridge.exposeInMainWorld('electron', {
   clearSessionCache: () => ipcRenderer.invoke('clear-session-cache'),
   // Update: Nimmt jetzt auch 'type' entgegen
   logToConsole: (msg, type) => ipcRenderer.send('log-to-console', msg, type),
+  openLogsFolder: () => ipcRenderer.invoke('open-logs-folder'),
   
   // Database Functions
   loadDatabase: (filePath) => ipcRenderer.invoke('load-database', filePath),
@@ -49,6 +50,7 @@ contextBridge.exposeInMainWorld('electron', {
   deleteFile: (config) => ipcRenderer.invoke('delete-file', config),
   renameFile: (config) => ipcRenderer.invoke('rename-file', config),
   checkFileExists: (config) => ipcRenderer.invoke('check-file-exists', config),
+  computeFileHash: (config) => ipcRenderer.invoke('compute-file-hash', config),
   showItemInFolder: (fullPath) => ipcRenderer.invoke('show-item-in-folder', fullPath),
   
   moveAndUpdateFile: (config) => ipcRenderer.invoke('move-and-update-file', config),

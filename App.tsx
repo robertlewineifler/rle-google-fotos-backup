@@ -62,6 +62,9 @@ const App: React.FC = () => {
   const isWalkingRef = useRef(false);
   const isAlbumModeRef = useRef(false);
   const albumTargetPathRef = useRef<string | null>(null);
+  // --- Stale-Panel-Schutz (0-ms-Detektor) ---
+  const prevTrueMetaRef = useRef<{ id: string; filename?: string; originalDate?: string; webTimestamp?: number } | null>(null);
+  const newDownloadMetaRef = useRef<Map<string, { filename: string; originalDate?: string }>>(new Map());
   
   // --- Computed Stats ---
   // Zählt, an wie vielen Tagen das Programm tatsächlich benutzt wurde (Scan-Aktivität)
@@ -89,7 +92,8 @@ const App: React.FC = () => {
     }
     
     const isRelevantForUI = 
-        type === 'error' || 
+        type !== 'debug' &&
+        (type === 'error' || 
         type === 'success' || 
         type === 'warning' ||
         type === 'album' ||
@@ -107,12 +111,12 @@ const App: React.FC = () => {
         message.includes('Metadaten') ||
         message.includes('Tageswechsel') ||
         message.includes('Batch') ||
-        message.includes('Scan-Log');
+        message.includes('Scan-Log'));
 
     if (isRelevantForUI) {
         setLogs(prev => {
             const newLogs = [...prev, { timestamp: Date.now(), message, type }];
-            if (newLogs.length > 100) return newLogs.slice(newLogs.length - 100);
+            if (newLogs.length > 300) return newLogs.slice(newLogs.length - 300);
             return newLogs;
         });
     }
@@ -135,6 +139,54 @@ const App: React.FC = () => {
           // NEU: Fehler beim Reset ignorieren
           if (e.message && e.message.includes('GUEST_VIEW_MANAGER_CALL')) return null;
           return null;
+      }
+  };
+
+  // --- STALE-PANEL-DETEKTOR (kostet im Normalfall 0 ms) ---
+  // Erkennt, ob der gerade gelesene Panel-Inhalt noch zum Vorgängerfoto gehört.
+  const evaluateScrapeTrust = (result: any, webTimestamp: number, entry?: DatabaseEntry): { trusted: boolean; reason: string } => {
+      const prev = prevTrueMetaRef.current;
+      if (!prev) return { trusted: true, reason: '' }; // Erstes Foto: Panel stand still
+
+      let prevDate: number | null = null;
+      if (prev.originalDate) {
+          const d = parseExifDateToDate(prev.originalDate);
+          if (d) prevDate = d.getTime();
+      }
+      if (prevDate === null && prev.webTimestamp) prevDate = prev.webTimestamp;
+
+      if (prevDate === null && !prev.filename) {
+          return { trusted: false, reason: 'Vorgänger-Referenz unvollständig' };
+      }
+
+      const within60 = (a: number, b: number) => Math.abs(a - b) <= 60000;
+      const sameName = (a?: string | null, b?: string | null) => !!a && !!b && a.toLowerCase() === b.toLowerCase();
+
+      const matchesPrev = (prevDate !== null && within60(webTimestamp, prevDate)) || sameName(result?.potentialFilename, prev.filename);
+
+      let matchesOwn = false;
+      if (entry?.originalDate) {
+          const od = parseExifDateToDate(entry.originalDate);
+          if (od) matchesOwn = within60(webTimestamp, od.getTime());
+      }
+
+      if (matchesPrev && !matchesOwn) {
+          return { trusted: false, reason: 'Panel zeigt vermutlich Vorgängerfoto' };
+      }
+      return { trusted: true, reason: '' };
+  };
+
+  // Merkt sich die verlässlichsten Metadaten des zuletzt besuchten Fotos (für den Detektor).
+  const rememberTrueMeta = (id: string, entry: DatabaseEntry | undefined, result: any, webTimestamp: number, trusted: boolean) => {
+      if (entry) {
+          prevTrueMetaRef.current = { id, filename: entry.filename, originalDate: entry.originalDate, webTimestamp: trusted ? webTimestamp : undefined };
+          return;
+      }
+      const dl = newDownloadMetaRef.current.get(id);
+      if (dl) {
+          prevTrueMetaRef.current = { id, filename: dl.filename, originalDate: dl.originalDate, webTimestamp: trusted ? webTimestamp : undefined };
+      } else {
+          prevTrueMetaRef.current = { id, filename: trusted ? (result?.potentialFilename || undefined) : undefined, originalDate: undefined, webTimestamp: trusted ? webTimestamp : undefined };
       }
   };
 
@@ -163,6 +215,7 @@ const App: React.FC = () => {
               });
 
               if (result.success) {
+                  newDownloadMetaRef.current.set(result.id, { filename: result.filename, originalDate: result.originalExifDate || undefined });
                   const ext = result.filename.split('.').pop()?.toLowerCase();
                   const isVideo = ['mp4', 'mov', 'm4v', 'avi', '3gp', 'mpg'].includes(ext || '');
                   const originalExifDate = parseExifDateToDate(result.originalExifDate || "");
@@ -677,6 +730,8 @@ const App: React.FC = () => {
       pendingStartResolvers.current.clear();
       isAlbumModeRef.current = false;
       albumTargetPathRef.current = null;
+      prevTrueMetaRef.current = null;
+      newDownloadMetaRef.current.clear();
       
       // 4. Force Cleanup of Webview State if possible
       setIsInitialized(false);
@@ -697,7 +752,7 @@ const App: React.FC = () => {
   };
 
   // --- CORE CRAWLER LOGIC ---
-  const initiateDownloadAsync = async (info: any, savePath: string, isAlbumDownload: boolean = false): Promise<void> => {
+  const initiateDownloadAsync = async (info: any, savePath: string, isAlbumDownload: boolean = false, trusted: boolean = true): Promise<void> => {
       const webDate = parseGoogleDateString(info.dateStr || "");
       if (isNaN(webDate.getTime())) return;
       
@@ -705,7 +760,8 @@ const App: React.FC = () => {
           id: info.id,
           targetDir: savePath,
           dateTimestamp: webDate.getTime(),
-          flatStructure: isAlbumDownload
+          flatStructure: isAlbumDownload,
+          trusted
       });
 
       const startPromise = new Promise<void>((resolve) => {
@@ -915,6 +971,8 @@ const App: React.FC = () => {
     minDateEncountered.current = null;
     maxDateEncountered.current = null;
     isResettingRef.current = false;
+    prevTrueMetaRef.current = null;
+    newDownloadMetaRef.current.clear();
 
     if (isAlbumMode) {
       addLog(`[ALBUM] Starte separaten Album-Download nach ${albumTargetPathRef.current}...`, 'album');
@@ -1050,6 +1108,7 @@ const App: React.FC = () => {
 
             // --- 3. Download Entscheidung ---
             let needsDownload = false;
+            let trustedForPhoto = true;
 
             if (isAlbumMode) {
                 // Im Album-Modus immer herunterladen, keine DB-Prüfung
@@ -1071,6 +1130,8 @@ const App: React.FC = () => {
                             needsDownload = true;
                         } else {
                             let metaUpdated = false;
+                            const trustInfo = evaluateScrapeTrust(result, webTimestamp, existingEntry);
+                            trustedForPhoto = trustInfo.trusted;
 
                             if (existingEntry.missingSince) {
                                  delete existingEntry.missingSince; 
@@ -1080,33 +1141,71 @@ const App: React.FC = () => {
                             }
 
                             if (result.potentialFilename && (!existingEntry.originalName || existingEntry.originalName !== result.potentialFilename)) {
-                                 const oldNameLog = existingEntry.originalName || "(keiner)";
-                                 existingEntry.originalName = result.potentialFilename;
-                                 metaUpdated = true;
-                                 dbDirty = true;
-                                 addLog(`📝 Metadaten: Original-Name aktualisiert (${oldNameLog} -> ${result.potentialFilename})`, 'info');
+                                 const candidateName = result.potentialFilename;
+                                 if (candidateName.toLowerCase() === existingEntry.filename.toLowerCase()) {
+                                     // Kandidat entspricht bereits dem Dateinamen -> nichts zu tun
+                                 } else if (!trustInfo.trusted) {
+                                     addLog(`⚠️ Namens-Korrektur übersprungen (${trustInfo.reason}): "${candidateName}" für ${existingEntry.filename}`, 'warning');
+                                 } else {
+                                     const oldNameLog = existingEntry.originalName || "(keiner)";
+                                     existingEntry.originalName = candidateName;
+                                     metaUpdated = true;
+                                     dbDirty = true;
+                                     addLog(`📝 Metadaten: Original-Name aktualisiert (${oldNameLog} -> ${candidateName})`, 'info');
+                                 }
                             }
 
                             if (Math.abs(existingEntry.timestamp - webTimestamp) > 60000) {
                                 const oldDateStr = new Date(existingEntry.timestamp).toLocaleString();
                                 const newDateStr = new Date(webTimestamp).toLocaleString();
-                                addLog(`📂 Verschiebe Datei: "${existingEntry.filename}"...`, 'warning');
-                                
-                                const moveResult = await window.electron.moveAndUpdateFile({
-                                    basePath: exportPath,
-                                    oldFilename: existingEntry.filename,
-                                    oldTimestamp: existingEntry.timestamp,
-                                    newTimestamp: webTimestamp
-                                });
 
-                                if (moveResult.success) {
-                                    existingEntry.timestamp = webTimestamp;
-                                    if (moveResult.newFilename) existingEntry.filename = moveResult.newFilename;
-                                    metaUpdated = true;
-                                    dbDirty = true;
-                                    addLog(`✅ Verschoben: ${oldDateStr} -> ${newDateStr}. Pfad angepasst.`, 'success');
+                                let plausible = true;
+                                if (existingEntry.originalDate) {
+                                    const od = parseExifDateToDate(existingEntry.originalDate);
+                                    if (od && Math.abs(webTimestamp - od.getTime()) > 30 * 24 * 60 * 60 * 1000) plausible = false;
+                                }
+
+                                if (!trustInfo.trusted) {
+                                    addLog(`⚠️ Datums-Korrektur übersprungen (${trustInfo.reason}): ${existingEntry.filename} ${oldDateStr} -> ${newDateStr}`, 'warning');
+                                } else if (!plausible) {
+                                    addLog(`⚠️ Datums-Korrektur übersprungen (unplausibel >30 Tage): ${existingEntry.filename} ${oldDateStr} -> ${newDateStr}`, 'warning');
+                                } else if (!existingEntry.hash) {
+                                    const hashRes = await window.electron.computeFileHash({ basePath: exportPath, filename: existingEntry.filename, timestamp: existingEntry.timestamp });
+                                    if (hashRes.success && hashRes.hash) {
+                                        existingEntry.hash = hashRes.hash;
+                                        dbDirty = true;
+                                        addLog(`🔐 Hash nachgetragen – Datums-Korrektur folgt beim nächsten Lauf: ${existingEntry.filename} ${oldDateStr} -> ${newDateStr}`, 'warning');
+                                    } else {
+                                        addLog(`⚠️ Datums-Korrektur übersprungen (Hash nicht lesbar): ${existingEntry.filename}`, 'warning');
+                                    }
                                 } else {
-                                    addLog(`❌ Fehler beim Verschieben: ${moveResult.error}`, 'error');
+                                    addLog(`📂 Verschiebe Datei: "${existingEntry.filename}"...`, 'warning');
+                                    const moveResult = await window.electron.moveAndUpdateFile({
+                                        basePath: exportPath,
+                                        oldFilename: existingEntry.filename,
+                                        oldTimestamp: existingEntry.timestamp,
+                                        newTimestamp: webTimestamp,
+                                        expectedHash: existingEntry.hash
+                                    });
+
+                                    if (moveResult.success) {
+                                        existingEntry.timestamp = webTimestamp;
+                                        if (moveResult.newFilename) existingEntry.filename = moveResult.newFilename;
+                                        if (moveResult.newHash) existingEntry.hash = moveResult.newHash;
+                                        metaUpdated = true;
+                                        dbDirty = true;
+                                        addLog(`✅ Verschoben: ${oldDateStr} -> ${newDateStr}. Pfad angepasst.`, 'success');
+                                    } else if (moveResult.error === 'HASH_MISMATCH') {
+                                        if (moveResult.actualHash) {
+                                            existingEntry.hash = moveResult.actualHash;
+                                            dbDirty = true;
+                                            addLog(`🔐 Hash aktualisiert (Datei wurde früher umgeschrieben) – Korrektur folgt beim nächsten Lauf: ${existingEntry.filename}`, 'warning');
+                                        } else {
+                                            addLog(`❌ Hash-Mismatch – Korrektur abgebrochen: ${existingEntry.filename}`, 'error');
+                                        }
+                                    } else {
+                                        addLog(`❌ Fehler beim Verschieben: ${moveResult.error}`, 'error');
+                                    }
                                 }
                             }
 
@@ -1125,7 +1224,14 @@ const App: React.FC = () => {
             }
 
             if (needsDownload) {
-                await initiateDownloadAsync(result, targetPath, isAlbumMode);
+                if (!isAlbumMode) {
+                    trustedForPhoto = evaluateScrapeTrust(result, webTimestamp, dbRef.current.files[result.id]).trusted;
+                }
+                await initiateDownloadAsync(result, targetPath, isAlbumMode, trustedForPhoto);
+            }
+
+            if (!isAlbumMode) {
+                rememberTrueMeta(result.id, dbRef.current.files[result.id], result, webTimestamp, trustedForPhoto);
             }
             
             if (!isWalkingRef.current) break;
@@ -1303,7 +1409,10 @@ const App: React.FC = () => {
         </div>
 
         <div className="hidden md:flex w-full md:w-1/4 p-3 border-r border-slate-700 flex-col min-w-0 opacity-50 hover:opacity-100 transition-opacity">
-             <div className="flex justify-between items-center mb-1"><h3 className="font-bold text-slate-400 uppercase text-xs tracking-wider">Wichtige Ereignisse</h3></div>
+             <div className="flex justify-between items-center mb-1">
+                 <h3 className="font-bold text-slate-400 uppercase text-xs tracking-wider">Wichtige Ereignisse</h3>
+                 <button onClick={() => window.electron.openLogsFolder()} className="text-[10px] text-slate-400 hover:text-white px-1" title="Log-Ordner öffnen">📜 Logs</button>
+             </div>
              <div className="flex-1 bg-black/50 rounded border border-slate-700 p-2 overflow-y-auto font-mono text-[10px] scrollbar-thin" ref={logContainerRef}>
                  {logs.map((l, i) => (
                     <div key={i} className={`mb-1 px-1 rounded ${

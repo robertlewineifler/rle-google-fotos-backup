@@ -62,6 +62,7 @@ export interface DownloadConfig {
     targetDir: string;
     dateTimestamp: number; // Für fs.utimes
     flatStructure?: boolean; // NEU: Keine Jahr/Monat-Unterordner (für Album-Downloads)
+    trusted?: boolean; // NEU: false => keine EXIF/QuickTime/FS-Rewrites (Panel unsicher)
 }
 
 export interface DownloadResult {
@@ -75,6 +76,7 @@ export interface DownloadResult {
     originalExifDate?: string; // Raw Exif String
     hash?: string; // SHA-256 Hash
     finalDateTimestamp?: number; // Das tatsächlich geschriebene Datum (ggf. mit Sekunden aus Original)
+    metadataWritten?: boolean; // NEU: false => Metadaten wurden bewusst nicht angefasst
 }
 
 export interface DownloadProgress {
@@ -151,6 +153,7 @@ declare global {
       createDirectory: (path: string) => Promise<boolean>;
       clearSessionCache: () => Promise<void>;
       logToConsole: (msg: string, type?: string) => void;
+      openLogsFolder: () => Promise<string>;
       
       // Database Ops
       loadDatabase: (filePath: string) => Promise<FileDatabase | null>; // Nimmt jetzt FilePath
@@ -171,14 +174,16 @@ declare global {
       deleteFile: (config: { basePath: string, filename: string, timestamp: number }) => Promise<boolean>;
       renameFile: (config: { basePath: string, oldName: string, newName: string, timestamp: number }) => Promise<boolean>;
       checkFileExists: (config: { basePath: string, filename: string, timestamp: number }) => Promise<boolean>;
+      computeFileHash: (config: { basePath: string, filename: string, timestamp: number }) => Promise<{ success: boolean, hash?: string, error?: string }>;
       
       // NEU: Verschieben und Metadaten Update
       moveAndUpdateFile: (config: { 
           basePath: string, 
           oldFilename: string, 
           oldTimestamp: number, 
-          newTimestamp: number 
-      }) => Promise<{ success: boolean, newFilename?: string, error?: string }>;
+          newTimestamp: number,
+          expectedHash?: string
+      }) => Promise<{ success: boolean, newFilename?: string, newHash?: string, actualHash?: string, error?: string }>;
 
       showItemInFolder: (fullPath: string) => Promise<void>;
 

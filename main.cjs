@@ -35,6 +35,59 @@ app.commandLine.appendSwitch('autoplay-policy', 'user-gesture-required');
 const isDev = !app.isPackaged;
 let mainWindow;
 
+// --- LOGGING & DB-BACKUPS ---
+const DB_BACKUP_INTERVAL_MS = 10 * 60 * 1000;
+const DB_BACKUP_MAX = 20;
+let currentDbPath = null;
+let lastDbBackupAt = 0;
+
+function getLogDir() {
+    const baseDir = currentDbPath ? path.dirname(currentDbPath) : app.getPath('userData');
+    return path.join(baseDir, 'Logs');
+}
+
+function appendLog(type, message) {
+    try {
+        const dir = getLogDir();
+        fs.mkdirSync(dir, { recursive: true });
+        const now = new Date();
+        const pad = n => (n < 10 ? '0' + n : n);
+        const day = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+        const line = `[${day} ${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}] [${type}] ${message}\r\n`;
+        fs.appendFile(path.join(dir, `backup-${day}.log`), line, () => {});
+    } catch (e) { /* Logging darf den Ablauf nie unterbrechen */ }
+}
+
+function maybeBackupDatabase(filePath) {
+    try {
+        if (!filePath || !fs.existsSync(filePath)) return;
+        const now = Date.now();
+        if (now - lastDbBackupAt < DB_BACKUP_INTERVAL_MS) return;
+        lastDbBackupAt = now;
+
+        const backupDir = path.join(path.dirname(filePath), 'Backups');
+        fs.mkdirSync(backupDir, { recursive: true });
+
+        const d = new Date(now);
+        const pad = n => (n < 10 ? '0' + n : n);
+        const stamp = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+        const target = path.join(backupDir, `gphotos_db_${stamp}.json`);
+        fs.copyFileSync(filePath, target);
+
+        const entries = fs.readdirSync(backupDir)
+            .filter(f => f.startsWith('gphotos_db_') && f.endsWith('.json'))
+            .map(f => ({ f, t: fs.statSync(path.join(backupDir, f)).mtimeMs }))
+            .sort((a, b) => a.t - b.t);
+        while (entries.length > DB_BACKUP_MAX) {
+            const oldest = entries.shift();
+            try { fs.unlinkSync(path.join(backupDir, oldest.f)); } catch (e) {}
+        }
+        appendLog('info', `DB-Backup erstellt: ${target}`);
+    } catch (e) {
+        appendLog('error', `DB-Backup fehlgeschlagen: ${e.message}`);
+    }
+}
+
 // Globaler State für den NÄCHSTEN Download-Vorgang (Initialisierung)
 // Da JS single-threaded ist, können wir dies kurzzeitig global halten, bis 'will-download' feuert.
 let nextDownloadConfig = {
@@ -77,6 +130,7 @@ function createWindow() {
 
     // KONFIGURATION SICHERN (Scope Capture für diesen spezifischen Download)
     const config = { ...nextDownloadConfig };
+    const trusted = config.trusted !== false;
     
     // Global sofort resetten, damit der nächste Loop nicht blockiert oder überschreibt
     nextDownloadConfig.active = false; 
@@ -139,6 +193,8 @@ function createWindow() {
 
     let savePath = path.join(targetSubFolder, finalFilename);
     item.setSavePath(savePath);
+
+    appendLog('info', `Download Start: id=${config.id} file=${finalFilename} dir=${targetSubFolder} webDate=${webDate.toLocaleString()} trusted=${trusted}`);
 
     // Fortschritts-Listener
     item.on('updated', (event, state) => {
@@ -231,10 +287,8 @@ function createWindow() {
             resultPayload.filename = finalFilename;
             resultPayload.path = savePath;
 
-            // --- HASH & METADATA ---
+            // --- METADATA ---
             let hash = null;
-            // Hash Berechnung asynchron lassen (Stream)
-            try { hash = await getFileHash(savePath); } catch(e) { console.error("Hash Error", e); }
             
             const isJpg = ['.jpg', '.jpeg'].includes(ext);
             const isVideo = ['.mp4', '.mov', '.m4v', '.avi', '.3gp', '.mpg', '.mts'].includes(ext);
@@ -268,13 +322,20 @@ function createWindow() {
             }
 
             // Schreibvorgänge
-            if (isJpg && binaryData) updateExifData(savePath, binaryData, finalDate);
-            if (isVideo) await updateVideoMetadataAsync(savePath, finalDate); // UPDATE: Async Update
-            
-            await updateFileTimestamps(savePath, finalDate);
+            if (trusted) {
+                if (isJpg && binaryData) updateExifData(savePath, binaryData, finalDate);
+                if (isVideo) await updateVideoMetadataAsync(savePath, finalDate); // UPDATE: Async Update
+                await updateFileTimestamps(savePath, finalDate);
+            } else {
+                appendLog('warning', `Metadaten-Rewrite übersprungen (untrusted): ${finalFilename} (Web-Datum ${webDate.toLocaleString()})`);
+            }
+
+            // Hash NACH dem Metadaten-Rewrite berechnen, damit er zum finalen Dateiinhalt passt.
+            try { hash = await getFileHash(savePath); } catch(e) { console.error("Hash Error", e); }
 
             // Ergebnis finalisieren
             resultPayload.success = true;
+            resultPayload.metadataWritten = trusted;
             resultPayload.originalExifDate = originalDateObj ? formatExifLike(originalDateObj) : null;
             resultPayload.hash = hash;
             resultPayload.finalDateTimestamp = finalDate.getTime();
@@ -288,6 +349,7 @@ function createWindow() {
           resultPayload.error = globalErr.message;
       } finally {
           // WICHTIG: Sende IMMER eine Antwort, damit der Slot im React-Frontend freigegeben wird.
+          appendLog(resultPayload.success ? 'success' : 'error', `Download ${state}: ${finalFilename}${resultPayload.error ? ' error=' + resultPayload.error : ''}`);
           mainWindow.webContents.send('download-complete', resultPayload);
       }
     });
@@ -323,6 +385,14 @@ app.on('window-all-closed', function () { if (process.platform !== 'darwin') app
 ipcMain.on('log-to-console', (event, message, type = 'info') => {
     const timestamp = new Date().toLocaleTimeString();
     console.log(`[${timestamp}] ${type}: ${message}`);
+    appendLog(type, message);
+});
+
+ipcMain.handle('open-logs-folder', async () => {
+    const dir = getLogDir();
+    try { fs.mkdirSync(dir, { recursive: true }); } catch (e) {}
+    const err = await shell.openPath(dir);
+    return err || dir;
 });
 
 ipcMain.handle('select-directory', async () => {
@@ -342,10 +412,13 @@ ipcMain.handle('create-directory', async (event, dirPath) => {
 
 ipcMain.handle('load-database', async (event, filePath) => {
     if (!fs.existsSync(filePath)) return null;
+    currentDbPath = filePath;
     try { return JSON.parse(fs.readFileSync(filePath, 'utf-8')); } catch (e) { return null; }
 });
 
 ipcMain.handle('save-database', async (event, filePath, data) => {
+    currentDbPath = filePath;
+    maybeBackupDatabase(filePath);
     try { fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8'); return true; } catch (e) { return false; }
 });
 
@@ -359,7 +432,7 @@ ipcMain.handle('save-text-file', async (event, filePath, content) => {
 });
 
 // NEU: Verschiebt und aktualisiert eine Datei, wenn sich das Datum geändert hat
-ipcMain.handle('move-and-update-file', async (event, { basePath, oldFilename, oldTimestamp, newTimestamp }) => {
+ipcMain.handle('move-and-update-file', async (event, { basePath, oldFilename, oldTimestamp, newTimestamp, expectedHash }) => {
     const oldDate = new Date(oldTimestamp);
     const newDate = new Date(newTimestamp);
 
@@ -376,6 +449,20 @@ ipcMain.handle('move-and-update-file', async (event, { basePath, oldFilename, ol
 
     if (!fs.existsSync(oldPath)) {
         return { success: false, error: "Ursprungsdatei nicht gefunden: " + oldPath };
+    }
+
+    // HASH-GATE: Nur umschreiben, wenn die Datei nachweislich zum DB-Eintrag gehört.
+    if (expectedHash) {
+        try {
+            const actualHash = await getFileHash(oldPath);
+            if (actualHash !== expectedHash) {
+                appendLog('error', `HASH_MISMATCH: ${oldPath} (erwartet=${expectedHash.substring(0,12)}… ist=${actualHash.substring(0,12)}…)`);
+                return { success: false, error: 'HASH_MISMATCH', actualHash };
+            }
+        } catch (hashErr) {
+            appendLog('error', `HASH_READ_ERROR: ${oldPath} (${hashErr.message})`);
+            return { success: false, error: 'HASH_READ_ERROR: ' + hashErr.message };
+        }
     }
 
     if (!fs.existsSync(newDir)) {
@@ -428,10 +515,16 @@ ipcMain.handle('move-and-update-file', async (event, { basePath, oldFilename, ol
             await updateVideoMetadataAsync(newPath, newDate);
         }
 
-        return { success: true, newFilename: finalFilename };
+        // Hash nach dem Umschreiben neu berechnen, damit er nicht veraltet.
+        let newHash = null;
+        try { newHash = await getFileHash(newPath); } catch (hashErr) { /* Hash optional */ }
+
+        appendLog('warning', `Verschoben: ${oldPath} -> ${newPath} (${oldDate.toLocaleString()} -> ${newDate.toLocaleString()})${expectedHash ? ' [Hash ok]' : ' [ohne Hash-Check]'}`);
+        return { success: true, newFilename: finalFilename, newHash };
 
     } catch (e) {
         console.error("Move failed:", e);
+        appendLog('error', `Move failed: ${oldPath} -> ${newPath} (${e.message})`);
         return { success: false, error: e.message };
     }
 });
@@ -670,6 +763,15 @@ ipcMain.handle('check-file-exists', async (event, { basePath, filename, timestam
     const month = (dateObj.getMonth() + 1).toString().padStart(2, '0');
     const filePath = path.join(basePath, year, month, filename);
     return fs.existsSync(filePath);
+});
+
+ipcMain.handle('compute-file-hash', async (event, { basePath, filename, timestamp }) => {
+    const dateObj = new Date(timestamp);
+    const year = dateObj.getFullYear().toString();
+    const month = (dateObj.getMonth() + 1).toString().padStart(2, '0');
+    const filePath = path.join(basePath, year, month, filename);
+    if (!fs.existsSync(filePath)) return { success: false, error: 'FILE_NOT_FOUND' };
+    try { return { success: true, hash: await getFileHash(filePath) }; } catch (e) { return { success: false, error: e.message }; }
 });
 
 ipcMain.handle('show-item-in-folder', async (event, fullPath) => {
