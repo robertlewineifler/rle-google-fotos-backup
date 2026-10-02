@@ -1,0 +1,453 @@
+# AGENTS.md – RLE Google Fotos Backup
+
+> **PFLICHTREGEL FÜR ALLE LLM-AGENTEN:**
+> Bei **jeder** Änderung am Code, an den Typen, an der Datenbankstruktur, an IPC-Kanälen, an den Build-Skripten oder am Verhalten der App muss diese `AGENTS.md` **im selben Arbeitsschritt** mit aktualisiert werden. Diese Datei ist die zentrale Wissensbasis für nachfolgende Chats/Agenten. Veraltete Angaben hier gelten als Bug.
+> Diese Datei nicht löschen oder umbenennen. Änderungen immer in deutscher Sprache ergänzen (Projektsprache).
+
+- Version (package.json): **1.1.0**
+- Plattform: **Windows-Desktop** (Electron). Kein Mac/Linux-Support angestrebt (Windows-spezifische Pfade/APIs).
+- Repository: `https://github.com/robertlewineifler/rle-google-fotos-backup`
+- UI-Sprache: **Deutsch**. Code-Bezeichner/Kommentare: überwiegend Englisch, teils Deutsch.
+
+---
+
+## 1. Was ist dieses Programm?
+
+Eine lokale Windows-Desktop-App, die die eigene **Google-Fotos-Bibliothek** sichert (Fotos + Videos). Sie lädt Dateien über einen **eingebetteten Browser (Electron `<webview>`)** herunter, indem sie die Google-Photos-Weboberfläche per simulierten Tastatureingaben fernsteuert (kein offizielles Google-API!). Danach werden lokale Metadaten korrigiert:
+
+- Dateien landen in `<Zielordner>/<Jahr>/<Monat>/` und werden auf das **Original-Aufnahmedatum** gesetzt (JPEG-EXIF, MP4/MOV-Atome und Dateisystem-Zeitstempel).
+- Eine **JSON-Datenbank** (`gphotos_db.json`) im Zielordner dokumentiert jede Datei, sodass Backups unterbrochen und fortgesetzt werden können.
+- Es gibt Integritätsprüfungen (fehlende/defekte/duplizierte Dateien), Namensbereinigung, CSV-Export, Scan-Heatmap und einen getrennten **Album-Download**.
+- Alles bleibt lokal: **keine Cloud, keine Telemetrie, keine externen Server** (einzige Ausnahme: geladene Webseite photos.google.com im Webview und Tailwind-CDN im index.html).
+
+### Grundprinzip / Warum Crawling statt API?
+`services/googlePhotosService.ts` enthält noch Alt-Code für die Google Photos Library API. Diese wird **nicht genutzt** und ist aktuell funktionslos (siehe Abschnitt 13 „Legacy/Tote Pfade“). Der eigentliche Download-Mechanismus ist der Webview-Crawler + Electron-`will-download`-Interception.
+
+---
+
+## 2. Tech-Stack & Befehle
+
+| Bereich | Technologie |
+|---|---|
+| Desktop-Shell | Electron 29 (`main.cjs`, CommonJS; `preload.cjs`, CommonJS) |
+| Frontend | React 18 + TypeScript 5, Vite 5, TailwindCSS via CDN (`index.html`) |
+| EXIF | `piexifjs` (JPEG lesen/schreiben) |
+| ZIP (Live Photos) | `adm-zip` |
+| Video-Metadaten | eigene MP4/MOV-Atom-Parser (kein ffmpeg!) |
+| Packaging | `electron-builder` (Ziele: `dir`, `portable`, `nsis`) → `release/` |
+| Tests | **keine** (kein Test-Framework im Repo) |
+
+### Befehle (`package.json`)
+
+```bash
+npm install
+
+npm run dev            # nur Vite-Dev-Server auf Port 5273 (strictPort)
+npm run electron:dev   # Vite + Electron parallel (concurrently -k) -> Entwicklungsmodus
+npm run build          # tsc (nur Typecheck, noEmit) && vite build -> dist/
+npm run electron:build # npm run build && electron-builder --win -> release/
+```
+
+- **Verifikation nach Änderungen:** mindestens `npm run build` (TypeScript-Typecheck + Bundle). Es gibt keinen Linter und keine Tests.
+- `DEV starten.bat` startet `npm run electron:dev` **als Administrator** (UAC-Prompt). Wird für den Webview/Download-Flow benötigt.
+- `vite.config.ts`: `base: './'` (wichtig für Electron-Dateipfade), Build nach `dist/`.
+- `tsconfig.json`: strict, `jsx: react-jsx`, `noEmit`. `webview`-JSX wird in `declarations.d.ts` als `any` deklariert. `piexifjs` ist dort ebenfalls als `any`-Modul deklariert.
+
+---
+
+## 3. Dateiübersicht & Verantwortlichkeiten
+
+```
+App.tsx                      Zentrale UI + komplette Crawler-/Backup-Orchestrierung (React)
+main.cjs                     Electron-Main: Downloads abfangen, Metadaten schreiben, Datei-/DB-IO, Logs, Backups
+preload.cjs                  contextBridge: window.electron IPC-API (CommonJS!)
+types.ts                     Alle TS-Typen inkl. window.electron-Interface (IPC-Typen)
+index.html                   HTML-Shell, Tailwind-CDN, Importmap, Custom-Scrollbar-Styles
+index.tsx                    React-Bootstrap (createRoot)
+declarations.d.ts            Modul-/JSX-Deklarationen (webview, *.png, piexifjs)
+logic/crawlerActions.ts      DOM-Steuerung im Webview (Tastatur-Events, Metadaten-Scraping)
+logic/databaseUtils.ts       CSV-Export, Duplikat-Auflösung (Orphan-Delete-Funktion ungenutzt)
+utils/exifUtils.ts           Datums-Parser (Google-Sidebar-Texte, EXIF), ISO-Datums-Helfer
+services/googlePhotosService.ts  LEGACY/TOT: Google-Photos-Library-API-Helfer (nicht angebunden)
+components/StartupScreen.tsx     Startbildschirm (DB laden/neu anlegen)
+components/ActionModals.tsx      CorrectionModal, IntegrityReportModal, RenameModal, AlbumDownloadModal
+components/ScanHeatmap.tsx       Scan-Historie-Heatmap (4 Ansichtsmodi)
+public/icon.ico, assets/icon.png Icons (Packaging/UI)
+.dev.local                   Platzhalter GEMINI_API_KEY (ungenutzt, nicht verwenden)
+dist/, release/              Build-Artefakte (via .gitignore ausgeschlossen)
+```
+
+**Wichtig:** `main.cjs` und `preload.cjs` sind **CommonJS** (package.json hat `"type": "module"`!). Dürfen nicht auf ESM umgestellt werden. Das Frontend ist ESM/TSX.
+
+---
+
+## 4. End-to-End Workflow (was wann passiert)
+
+### 4.1 Start
+1. `StartupScreen` erscheint (App.tsx ist erst nach `isInitialized` die Haupt-UI).
+2. **„Vorhandene .json laden“** → Datei-Dialog (`select-database-file`) → DB laden, `basePath` aus Dateipfad ableiten.
+   - Enthält die DB `hashScheme !== 2`, läuft eine **einmalige Migration**: alter `hash` → `sourceHash`, `hash` gelöscht, `hashScheme = 2`, DB wird sofort gespeichert.
+   - `scannedDays` wird initialisiert, falls altes Format.
+3. **„Neuen Ordner wählen“** → Ordner-Dialog (`select-directory`) → DB-Struktur im Speicher anlegen, Pfad `<Ordner>/gphotos_db.json`. Existiert die Datei schon, wird nur gewarnt (nichts überschrieben).
+
+### 4.2 Backup starten
+1. Nutzer meldet sich im eingebetteten Webview (`https://photos.google.com`) an und öffnet ein beliebiges Foto (`/photo/<id>`-URL ist Pflicht).
+2. „▶ Start Backup“ prüft die URL:
+   - `/search/` → **blockiert** (Meldung: Suche deaktiviert, um Duplikate zu vermeiden).
+   - `/album/` oder `/share/` → öffnet stattdessen den **AlbumDownloadModal**.
+   - sonst: `/photo/` muss enthalten sein, sonst Fehler „Bitte öffne zuerst ein Bild!“.
+3. `runBackupSession(false)` startet den Loop:
+   - Infopanel per `i` umschalten (`toggleInfoPanel`), 1 s warten.
+   - Schleifenbedingung: `isWalkingRef.current === true`.
+   - **Parallelitätsgrenze:** max. 5 aktive Downloads (`activeDownloadsRef >= 5` → 500 ms warten).
+   - **Batch-Limit 1000:** Nach 1000 Loop-Iterationen auf alle Downloads warten, DB speichern, 1,5 s Pause (Sicherheitscheckpoint).
+   - **Autosave:** alle 30 s `saveDatabase()` (nur Haupt-Backup, nicht Album).
+4. Pro Iteration:
+   a. `safeExtractInfo()` (mit 3-s-Timeout) liest Bild-ID (aus URL) + Sidepanel-Text (Datum + evtl. Dateiname). Bis zu 5 Versuche à 500 ms, wenn kein valides Datum.
+   b. Datum via `parseGoogleDateString(webDate)`; bei NaN → `navigatePrevious` + `navigateNext` + `killVideoPlayers` + Reload-Versuche; nach 3 Fehlern in Folge wird das Bild übersprungen.
+   c. **Tageswechsel-Erkennung:** ändert sich `getIsoDateString(webDate)` gegenüber `lastDayIdentifier`, wird der **vorherige, volle Tag** in `db.scannedDays[YYYY-MM-DD] = Date.now()` eingetragen (der erste Tag einer Session wird absichtlich ausgelassen, weil er evtl. unvollständig gescannt wurde). Dabei wird `batchCounter` zurückgesetzt und die DB gespeichert.
+   d. `updateRangeTracking(webTimestamp)` aktualisiert Min/Max-Datum der Session; `sessionSeenIds.add(id)`.
+   e. **Download-Entscheidung (nur Haupt-Backup):**
+      - ID unbekannt → Download.
+      - ID bekannt, Datei fehlt physisch (`check-file-exists`) → Download + Warnlog.
+      - ID bekannt, Datei existiert → **kein Download**, aber Metadaten-Abgleich:
+        * `missingSince` löschen (wiedergefunden).
+        * `originalName` aus Panel-Filename aktualisieren (nur wenn „trusted“, siehe Abschnitt 9).
+        * Weicht `entry.timestamp` um > 60 s vom Web-Datum ab → Datei verschieben/umschreiben via `moveAndUpdateFile` – **nur mit Hash-Gate** (siehe 6.3). Ohne gespeicherten Hash wird dieser erst nachgetragen und die Korrektur auf den nächsten Lauf verschoben.
+        * `scannedAt = Date.now()`.
+   f. **Download anstoßen** (`initiateDownloadAsync`): `prepareDownload(config)` → `triggerDownloadKeys(webview)` (simuliert **Shift+D**) → warten auf `download-started`-Event (max. 15 s Timeout) → ID zu `processedIdsRef` hinzufügen, `activeDownloads` erhöhen.
+   g. **Navigation:** `navigateNext` (ArrowRight) + `killVideoPlayers`, dann bis zu 30× à 200 ms prüfen, ob die URL-ID wechselt (`navigateAndVerifyChange`). Kein Wechsel nach 6 s → Loop bricht ab (vermutlich Bibliotheksende).
+5. Nach dem Loop: auf alle aktiven Downloads warten.
+6. `finishBackupSession()` (nur Haupt-Backup): `checkForOrphans()` + DB speichern + Log „Backup-Vorgang beendet.“
+   - `checkForOrphans`: markiert DB-Einträge, deren `timestamp` in **kompletten gescannten Tagen** liegt (safeStart = Min-Datum + 1 Tag um 00:00, safeEnd = Max-Datum um 00:00) und deren ID nicht in `sessionSeenIds` ist, mit `missingSince`.
+7. „⏹ Stop“ setzt `isWalkingRef=false` und speichert sicherheitshalber.
+
+### 4.3 Einzel-Download („⬇ 1“)
+- Nur wenn nicht `isWalking`, Zielordner vorhanden und URL-Kontext nicht Suche/Album/Share.
+- Liest Metadaten (ggf. Infopanel-Toggle), prüft DB + physische Existenz, lädt sonst einzeln herunter. **Trusted ist hier immer `true`** (kein Stale-Panel-Detektor).
+- Kein Album-/Scan-Tracking.
+
+### 4.4 Download-Ergebnis (Frontend `onDownloadComplete`)
+- Haupt-Backup: Eintrag in `dbRef.current.files[id]` mit `filename`, `originalName`, `timestamp` (= finales Datum), `savedAt`, `downloadedAt`, `scannedAt`, `originalDate` (EXIF-String), `hash`, `sourceHash`. **`integrityStatus` wird absichtlich NICHT gesetzt** → Datei gilt als „ungeprüft“.
+- Album-Modus: **kein DB-Eintrag**, nur Log + Anzeige in der „Neue Dateien“-Liste (max. letzte 100).
+- Vergleich Web-Datum ↔ Original-EXIF: Abweichung > 60 s → UI-Status „Manuell“ (⚠) und Warn-Log; sonst „OK“ (✔).
+- `activeProgress` wird pro `progressFilename`/`filename` entfernt, `activeDownloadsCount` dekrementiert.
+
+---
+
+## 5. Download-Pipeline im Main-Prozess (`main.cjs`)
+
+### 5.1 `will-download`-Handler
+- Reagiert nur, wenn `nextDownloadConfig.active === true` (Werte kommen via `prepare-download`). Ungeplante Downloads werden ignoriert (return, kein Tracking).
+- `nextDownloadConfig` ist ein **globaler Singleton**; deshalb wartet das Frontend nach `triggerDownloadKeys` auf das `download-started`-Signal, bevor die nächste ID vorbereitet wird.
+- Pfadlogik:
+  - Normal: `<targetDir>/<YYYY>/<MM>/`
+  - Album (`flatStructure: true`): direkt `<targetDir>/` (also z. B. `…/Alben/Urlaub_2024/`)
+- **Dateinamen-Sanitizing:**
+  - Endung wird **case-insensitiv** abgetrennt und in Kleinbuchstaben normalisiert (`.MP4` → `.mp4`).
+  - Basisname auf **100 Zeichen** gekürzt (Google liefert teils Beschreibungen als Namen).
+  - Kollisionen im Zielordner: `Name (1).ext`, `Name (2).ext`, … (Zähler-Schleife, `fs.existsSync`).
+- Log-Einträge: Download-Start mit id/Datei/Ordner/Web-Datum/trusted; Abschluss mit Source-/File-Hash-Prefix.
+
+### 5.2 ZIP-Handling (Live Photos)
+- Nur bei `.zip`: `adm-zip` sucht den ersten Eintrag (nicht Ordner, kein `__macosx`) mit `.jpg`/`.jpeg`.
+- Bild wird entpackt, Kollisionen erhalten `(n)`, das ZIP wird gelöscht (best effort), `savePath`/`finalFilename`/`ext` werden auf das Bild umgestellt.
+- Fehler beim Entpacken: Download gilt trotzdem als erfolgreich, ZIP bleibt liegen.
+
+### 5.3 Metadaten
+1. **sourceHash** = SHA-256 der rohen Datei **vor** jedem Rewrite (stabiler Quell-Fingerprint).
+2. Original-Datum lesen:
+   - **JPEG:** `piexif.load` → bevorzugt `Exif.DateTimeOriginal` (Tag 36867), sonst `0th.DateTime` (306).
+   - **Video** (`.mp4 .mov .m4v .avi .3gp .mpg .mts`): eigener MVHD-Parser (siehe 7.2).
+3. **finalDate** = `webDate`; hat `originalDate` dieselbe Minute (`YYYY-MM-DD HH:MM`) wie `webDate`, wird `originalDate` (inkl. Sekunden!) übernommen.
+4. **Nur wenn `trusted`** (siehe 9): JPEG-EXIF, Video-Atome und Dateisystem-Zeitstempel werden geschrieben. Bei `trusted=false`: Log „Metadaten-Rewrite übersprungen“, `metadataWritten=false` im Ergebnis.
+5. **hash** = SHA-256 **nach** dem Rewrite (entspricht der Datei auf der Platte).
+
+### 5.4 Ergebnis-Payload (`download-complete`)
+`{ id, success, filename, progressFilename, originalName, path, error, originalExifDate, hash, sourceHash, finalDateTimestamp, metadataWritten }`
+- `progressFilename` ist der Name, unter dem Fortschritt gemeldet wurde (wichtig, weil ZIPs umbenannt werden).
+- Im `finally` wird **immer** geantwortet, damit der Frontend-Slot freigegeben wird.
+
+---
+
+## 6. Datenbank (`gphotos_db.json`)
+
+### 6.1 Struktur (`types.ts` → `FileDatabase`, `DatabaseEntry`)
+```jsonc
+{
+  "basePath": ".",              // wird beim Speichern immer auf "." gesetzt (relativ zur JSON-Datei)
+  "lastUpdated": 1234567890,
+  "hashScheme": 2,              // 2 = hash/sourceHash getrennt
+  "scannedDays": { "2024-05-01": 1714590000000 },   // Tag -> Zeitpunkt des letzten Scans
+  "files": {
+    "<GooglePhotoId>": {
+      "filename": "IMG_1234.jpg",      // lokaler Name (inkl. evtl. "(n)")
+      "originalName": "IMG_1234.jpg",  // Name auf Google (ohne Kollisionszähler)
+      "timestamp": 1234567890,          // Web-Datum; bestimmt den Ordner YYYY/MM
+      "originalDate": "2024:05:01 12:00:00",
+      "savedAt": 0,                     // LEGACY
+      "downloadedAt": 0, "scannedAt": 0,
+      "hash": "…",                      // SHA-256 der Datei auf der Platte
+      "sourceHash": "…",                // SHA-256 des Rohdownloads
+      "size": 123456,                   // Bytes (durch Struktur-Check befüllt)
+      "missingSince": 0,                // Timestamp, gesetzt wenn Datei nicht gefunden
+      "integrityStatus": "ok|corrupt",  // undefined = ungeprüft
+      "integrityCheckedAt": 0
+    }
+  },
+  "scannedRanges": []            // LEGACY, wird per „Bereinigen“ entfernt
+}
+```
+- Key der `files`-Map ist die **Google Photo ID** (aus der URL `/photo/<id>`).
+- `basePath` im JSON ist nur informativ; der echte Basisordner wird beim Laden aus dem Dateipfad abgeleitet.
+- `hashScheme`-Migration 1→2 passiert automatisch in `handleInitLoadDatabase` (App.tsx).
+- Die UI führt `processedIdsRef = Set(Object.keys(db.files))` mit; das ist die bekannte ID-Menge der Session.
+
+### 6.2 Speichern & Backups
+- `saveDatabase` ruft IPC `save-database`; dieses schreibt `JSON.stringify(data, null, 2)` und ruft vorher `maybeBackupDatabase`.
+- **DB-Backups:** `maybeBackupDatabase` kopiert höchstens **alle 10 Minuten** nach `<DB-Ordner>/Backups/gphotos_db_<YYYY-MM-DD_HHMMSS>.json`; es werden max. **20** Backups behalten (älteste werden gelöscht).
+- Speichern passiert u. a.: nach Download-Complete nicht, sondern bei Trigger `saveDatabase()` (Integrität, Rename, Korrekturen, 30-s-Autosave, Tageswechsel, Batch-Limit, Stop, Session-Ende).
+
+### 6.3 Hash-Gate (wichtigstes Sicherheitskonzept)
+- `hash` beschreibt den **aktuellen Dateiinhalt**; `sourceHash` den Rohdownload.
+- `move-and-update-file` und `rename-file` akzeptieren `expectedHash`:
+  - Stimmt der tatsächliche SHA-256 nicht überein → **kein Schreibzugriff**, Antwort `HASH_MISMATCH` + `actualHash`.
+  - Frontend aktualisiert bei Mismatch den gespeicherten Hash und verschiebt die Korrektur auf den nächsten Lauf (verhindert Endlosschleifen und schützt vor fremden Dateien).
+- Ohne gespeicherten Hash wird zuerst `compute-file-hash` ausgeführt und die Korrektur ebenfalls vertagt.
+- Gleiches Gate gilt beim Umbenennen.
+
+---
+
+## 7. Metadaten-Korrektur im Detail
+
+### 7.1 JPEG-EXIF (`updateExifData`)
+Schreibt `YYYY:MM:DD HH:MM:SS` in:
+- `Exif.DateTimeOriginal` (36867)
+- `Exif.DateTimeDigitized` (36868)
+- `0th.DateTime` (306)
+
+### 7.2 MP4/MOV (`readVideoMetadataAsync` / `updateVideoMetadataAsync`)
+- Eigener ISO-BMFF-Atom-Parser (async, mit `fileHandle.read/write`):
+  - **Lesen:** toppt `moov`-Container, sucht `mvhd`, liest je nach Version 32-/64-Bit-Zeit; Zeitbasis **1904-01-01** (Offset `2082844800` Sekunden).
+  - **Schreiben:** rekursiv durch `moov` → `trak` → `mdia`; patcht `mvhd`, `tkhd`, `mdhd` (CreationTime + ModificationTime), Version 0 = 4 Byte, Version 1 = 8 Byte.
+- Kein ffmpeg. Für unbekannte Container (`.avi`, `.mts`) wird gelesen/geschrieben versucht, kann aber fehlschlagen.
+
+### 7.3 Dateisystem-Zeitstempel (`updateFileTimestamps`)
+- `fs.utimesSync(filePath, date, date)`.
+- **Windows-Zusatz:** per `powershell.exe -NoProfile -Command` werden `CreationTime`, `LastWriteTime`, `LastAccessTime` über `Get-Item -LiteralPath` gesetzt (Pfad wird mit einfachen Anführungszeichen escaped: `'` → `''`).
+- Fehler werden nur geloggt, nie geworfen.
+
+---
+
+## 8. Integritätsprüfung & Wartung
+
+### 8.1 Struktur-Check (IPC `check-db-integrity` / Button „🏗️ Struktur prüfen“)
+- Prüft für jede DB-Datei, ob `<basePath>/<YYYY>/<MM>/<filename>` existiert → `missing`.
+- Sammelt `sizeUpdates` (Dateigröße in Bytes) und, falls kein Hash vorhanden, berechnet er Hashes → `updates`.
+- Mit `onlySubset=true` werden Hashes für Dateien mit `integrityStatus === 'ok'` und vorhandenem Hash übersprungen (Performanz).
+- **Duplikaterkennung:**
+  1. Hash-basiert über alle validen Dateien.
+  2. Heuristisch: Dateien mit Muster `Name (n).ext`, deren Basisdatei `Name.ext` im selben Monatsordner existiert und **gleiche Größe ± 2 s mtime** hat → künstliche Duplikatgruppe (`HEURISTIC_…`).
+- Ergebnis wird im Frontend in die DB übernommen (Hashes, Größen), `missing` sofort als `missingSince` markiert, dann DB-Speichern.
+
+### 8.2 Inhalts-Check / Deep Scan (IPC `verify-file-integrity-batch` / „💾 Inhalt prüfen“)
+- Chunks von **20** Dateien; pro Datei:
+  - `stat`: 0 Bytes → `corrupt`.
+  - Datei wird als kompakter Read-Stream **komplett gelesen** (findet I/O-Fehler/bad sectors). JPEG-EOF-Check (FF D9) wurde bewusst entfernt („zu strikt“).
+  - `ENOENT` wird ignoriert (Missing macht der Struktur-Check).
+- Dashboard zeigt Statistik (OK/Defekt/Ungeprüft). Option „Nur Ungeprüfte/Defekte scannen“ vs. „ALLES neu scannen“.
+- Ergebnis setzt `integrityStatus` + `integrityCheckedAt` in der DB (Silent Save).
+
+### 8.3 Korrektur-Modal
+- **Vermisste Dateien (Orphans):** aus DB löschen (Cleanup) oder „Status zurücksetzen“ (ignorieren) oder „🌐 Web öffnen“ (`https://photos.google.com/photo/<id>` im Webview → Nutzer kann manuell neu herunterladen; Modal schließt).
+- **Defekte Dateien:** „Löschen“ entfernt die Datei **physisch**, der DB-Eintrag bleibt bewusst bestehen (ohne `integrityStatus`/`hash`) → beim nächsten Backup wird sie neu geladen. „Alle von Festplatte löschen“ als Batch.
+
+### 8.4 Namensbereinigung (IPC `find-renamable-files` / „✨ Dateinamen bereinigen“)
+- Kandidaten sind Dateien mit Muster `Name (n).ext`, bei denen:
+  1. `originalName` vorhanden ist,
+  2. `originalName` **nicht** selbst exakt der aktuelle Name ist (echte Google-Namen mit Klammer werden geschützt),
+  3. der Dateistamm (ohne Endung, case-insensitiv) von `originalName` und Basisname (`Name.ext`) übereinstimmt (deckt `.JPG`/`.jpg`/HEIC→jpg ab),
+  4. die `(n)`-Datei existiert,
+  5. der Zielname frei ist.
+- Basisdatei existiert bereits → kein Rename (Duplikat-Verdacht).
+- `stats` zählt: `nTotal`, `legitNames`, `noName`, `nameMismatch`, `currentMissing`, `collisionPair`, `targetMissing`. Bei 0 Kandidaten zeigt die App einen Erklär-Dialog (interne Logik in App.tsx, Meldungstext dort).
+- Ausführung: `rename-file` mit Hash-Gate; bei Erfolg `db.files[id].filename = newName`, ein DB-Save am Ende.
+
+### 8.5 CSV-Export („📄 Excel CSV Export“)
+- Datei: `<DB-Ordner>/gphotos_export_YYYY-MM-DD.csv`.
+- **UTF-8 mit BOM** (`\uFEFF`), Trennzeichen **Semikolon**, Felder in Anführungszeichen (`"` wird verdoppelt), sortiert nach `timestamp` absteigend.
+- Spalten: ID; Filename; Original Name; Web Date (Readable); Timestamp; Original Date; Hash; Source Hash; Integrity Status (Nicht geprüft/OK/Defekt); Saved At; Downloaded At; Scanned At; Missing Since.
+
+### 8.6 Legacy-Bereinigung („Bereinigen“ im Struktur-Bericht)
+- Entfernt `scannedRanges` (Root) und alle unbekannten Felder aus `files`-Einträgen. Gültige Keys (müssen synchron gehalten werden!):
+  `filename, timestamp, originalDate, originalName, savedAt, downloadedAt, scannedAt, hash, sourceHash, missingSince, id, integrityStatus, integrityCheckedAt, size`.
+- Die gleiche Key-Liste existiert **doppelt**: in `App.tsx` (`executeCleanLegacy`) und in `components/ActionModals.tsx` (Legacy-Zählung). **Bei Schema-Änderungen beide Stellen anpassen!**
+
+### 8.7 Duplikate auflösen
+- `resolveDuplicatesOnDisk` (logic/databaseUtils.ts): pro Duplikatgruppe gewinnt die Datei mit dem **kürzesten Dateinamen**, bei Gleichstand die **älteste** (`timestamp`). Alle anderen werden physisch gelöscht und aus der DB entfernt.
+
+### 8.8 Scan-Heatmap
+- `scannedDays` (Tag → Scan-Zeitpunkt) + DB-Dateien werden pro Kalenderjahr als GitHub-Style-Grid gerendert.
+- 4 Modi: **Relativ (grün)**, **Absolut (blau, Alter des Scans)**, **Menge (rot, Fotos/Tag)**, **Größe (gelb, Bytes/Tag)**.
+- Sonderfälle: gescannt & 0 Fotos = gestreift; Fotos vorhanden, aber nie gescannt = amber Warnfarbe.
+
+---
+
+## 9. Trust-/Stale-Panel-Mechanik (wichtig, leicht zu brechen!)
+
+Google Photos aktualisiert das Info-Sidepanel asynchron verzögert beim Navigieren. Dadurch kann der Scraper **Metadaten des Vorgängerfotos** lesen.
+
+- `prevTrueMetaRef` merkt sich das zuletzt verlässlich gescannte Foto (`id`, `filename`, `originalDate`, `webTimestamp`). `newDownloadMetaRef` puffert Downloads der Session.
+- `evaluateScrapeTrust(result, webTimestamp, entry)`:
+  - Kein Vorgänger → vertrauenswürdig.
+  - Vorgänger-Datum (EXIF oder Web) bzw. `filename` vergleichen: Match innerhalb 60 s oder gleicher Name (`potentialFilename`).
+  - Wenn es dem Vorgänger ähnelt, **aber nicht zum eigenen DB-Eintrag passt** → `trusted=false` („Panel zeigt vermutlich Vorgängerfoto“).
+- Konsequenzen bei `trusted=false`:
+  - Download läuft trotzdem, aber **`trusted=false` im Download-Config** → Main-Prozess schreibt **keine** Metadaten (EXIF/Video/FS), `metadataWritten=false`.
+  - Namens-/Datums-Korrekturen werden mit Warnlog übersprungen.
+  - `rememberTrueMeta` speichert den Web-Timestamp dann nicht als verlässlich.
+- `handleSingleDownload` nutzt diesen Detektor **nicht** (immer `trusted=true`).
+- `panelSignature` wird vom Scraper berechnet, aktuell aber im Frontend nicht verwendet (Reserve).
+
+---
+
+## 10. Album-Download (getrennt vom Backup)
+
+- Auslöser: URL-Kontext `/album/` oder `/share/` bei Start/`⬇ 1` → `AlbumDownloadModal` (Ordnername, Sanitizing `[\\/:*?"<>|]` → `_`).
+- Ziel: `exportPath + '\\Alben\\' + folderName` (**hartkodierter Backslash**, Windows only; flache Struktur).
+- Verhalten: **immer herunterladen**, keine DB-Prüfung, **kein DB-Eintrag**, keine Statistik, keine `scannedDays`, keine Orphan-Prüfung. Logs mit Typ `album` (violett in der UI).
+- Duplikate sind ausdrücklich erwünscht; der Ordner kann separat gelöscht werden.
+- `isAlbumModeRef` steuert das Verhalten global; nach dem Loop wird es zurückgesetzt.
+
+---
+
+## 11. IPC-API (preload.cjs → `window.electron`)
+
+Alle Kanalnamen exakt so (main.cjs `ipcMain`):
+
+| Preload-Funktion | Kanal | Typ | Zweck |
+|---|---|---|---|
+| `selectDirectory` | `select-directory` | invoke | Ordner-Dialog |
+| `selectDatabaseFile` | `select-database-file` | invoke | JSON-Datei-Dialog |
+| `createDirectory` | `create-directory` | invoke | Ordner anlegen |
+| `clearSessionCache` | `clear-session-cache` | invoke | `session.clearStorageData()` |
+| `logToConsole` | `log-to-console` | send | Log in Konsole + Datei |
+| `openLogsFolder` | `open-logs-folder` | invoke | Log-Ordner öffnen |
+| `loadDatabase` | `load-database` | invoke | JSON lesen, setzt `currentDbPath` |
+| `saveDatabase` | `save-database` | invoke | JSON schreiben + DB-Backup |
+| `saveTextFile` | `save-text-file` | invoke | CSV schreiben |
+| `checkIntegrity` | `check-db-integrity` | invoke | Struktur-Check (Objekt-Argument!) |
+| `findRenamableFiles` | `find-renamable-files` | invoke | Rename-Kandidaten |
+| `verifyFileIntegrityBatch` | `verify-file-integrity-batch` | invoke | Deep Scan |
+| `prepareDownload` | `prepare-download` | invoke | Setzt `nextDownloadConfig` |
+| `onDownloadStarted` | `download-started` | on | Slot-Freigabe |
+| `onDownloadComplete` | `download-complete` | on | Ergebnis |
+| `onDownloadProgress` | `download-progress` | on | Fortschritt |
+| `removeDownloadListener` | – | – | entfernt alle 3 Listener |
+| `deleteFile` | `delete-file` | invoke | Datei löschen |
+| `renameFile` | `rename-file` | invoke | Umbenennen (Hash-Gate) |
+| `checkFileExists` | `check-file-exists` | invoke | Existenzprüfung |
+| `computeFileHash` | `compute-file-hash` | invoke | SHA-256 |
+| `moveAndUpdateFile` | `move-and-update-file` | invoke | Verschieben + Metadaten (Hash-Gate) |
+| `showItemInFolder` | `show-item-in-folder` | invoke | Explorer |
+| `googleApiRequest` | `google-api-request` | invoke | **KEIN Handler in main.cjs vorhanden → toter Kanal** |
+
+- Die TS-Typisierung liegt in `types.ts` im `declare global { interface Window { electron: … } }`. **Neue IPC-Funktionen immer an drei Stellen ergänzen: `main.cjs` (Handler), `preload.cjs` (Bridge), `types.ts` (Typ).**
+- `checkIntegrity` wird in der Typisierung noch mit `(basePath, files)` beschrieben, tatsächlich ruft App.tsx `(basePath, files, onlySubset)` mit `@ts-ignore`. Bei Gelegenheit Typisierung nachziehen.
+
+---
+
+## 12. UI-Struktur (App.tsx, Zeilen ~1313 ff.)
+
+- **StartupScreen** solange `!isInitialized`.
+- **Webview-Bereich** oben (`https://photos.google.com`, `allowpopups`). Overlays:
+  - Download-Fortschrittsbalken (links oben, bis 5 gleichzeitig).
+  - „Turbo Backup“-Panel (rechts oben): `processedCount`, aktive Downloads x/5, Batch x/1000.
+- **Untere Leiste (h-64):**
+  - Links: Status, Scan-Historie-Button, Duplikat-Warnung, „Datenbank prüfen“, „Dateinamen bereinigen“, „Korrekturen“ (rot, wenn Orphans/Corrupt), CSV-Export, Reset, Logout, Start/Stop, „⬇ 1“.
+  - Mitte: Log-Fenster (nur relevante Meldungen, max. 300 Einträge, Button „Logs“ öffnet Ordner).
+  - Rechts: Liste „Neue Dateien“ (max. letzte 100, Web vs. Original-Datum, ✔/⚠).
+- **Log-Filterung** (`addLog`): Alles geht an Konsole/Logdatei, aber die UI zeigt nur `error/success/warning/album` sowie Meldungen mit Schlüsselwörtern (Backup, Datenbank, Bereinigung, Status, Web, Bereits, Bekannt, vermisst, Warte, Umbenannt, Verschoben, Metadaten, Tageswechsel, Batch, Scan-Log). Debug nur Konsole.
+- **`isResettingRef`** blockiert während Reset alle State-/IPC-Updates.
+- **Reset** setzt sämtliche States/Refs zurück (dbRef, processedIds, Progress, Modals, Album-Refs) und zeigt wieder den StartupScreen.
+- **Logout** (`clearCacheAndLogout`): `clearSessionCache()` + Navigation zu `https://accounts.google.com/Logout`.
+
+---
+
+## 13. Logging & Dateien auf der Platte
+
+| Artefakt | Ort | Details |
+|---|---|---|
+| Datenbank | `<Zielordner>/gphotos_db.json` | siehe Abschnitt 6 |
+| DB-Backups | `<Zielordner>/Backups/gphotos_db_<stamp>.json` | max. 20, min. 10 min Abstand |
+| Logs | `<Zielordner>/Logs/backup-YYYY-MM-DD.log` | Tagesrotation; vor DB-Load: `app.getPath('userData')/Logs` |
+| CSV-Export | `<Zielordner>/gphotos_export_YYYY-MM-DD.csv` | UTF-8 BOM, Semikolon |
+| Fotos/Videos | `<Zielordner>/<YYYY>/<MM>/` | Album: `<Zielordner>/Alben/<Name>/` flach |
+| Build | `dist/`, `release/` | ignoriert von Git |
+
+- `appendLog` schreibt fehlertolerant (try/catch, bricht nie den Ablauf ab).
+- `main.cjs` loggt zusätzlich jeden Download-Start/-Abschluss mit Hash-Präfixen.
+
+---
+
+## 14. Legacy / tote Pfade / bekannte Fallstricke
+
+Diese Punkte sind bewusst dokumentiert, damit Agenten sie nicht für funktionierenden Code halten:
+
+1. **`services/googlePhotosService.ts` ist tot.** Der zugehörige `google-api-request`-IPC-Handler fehlt in `main.cjs`. Aufrufe würden fehlschlagen. Downloads laufen ausschließlich über den Webview-Crawler.
+2. **Unbenutzte Exporte:** `formatDateForExif`, `blobToDataURL`, `dataURLtoBlob` (exifUtils.ts), `deleteOrphansFromDisk` (databaseUtils.ts), `determineAlbumName` (crawlerActions.ts), `AppState` (types.ts), `panelSignature` (Rückgabe, aber ungenutzt).
+3. **`scannedRanges`** ist Legacy (Root-Feld). Nur noch für Migration/Bereinigung relevant.
+4. **Doppelte Valid-Key-Listen** für die Legacy-Bereinigung (App.tsx + ActionModals.tsx) – synchron halten!
+5. **`basePath` wird beim Speichern auf `"."` gesetzt** – der echte Basispfad kommt beim Laden aus dem Dateipfad. Nicht „korrigieren“, das ist Absicht (portable DB).
+6. **`index.html`** lädt eine Importmap mit React 19 von esm.sh, obwohl package.json React 18 nutzt; Vite bundelt ohnehin. Harmlos, aber nicht als Vorbild nehmen.
+7. **Tailwind läuft über CDN** (`cdn.tailwindcss.com`) – die App braucht Internetzugang zum Laden der UI-Styles (Webview braucht das ohnehin).
+8. **`.env.local`** enthält nur einen ungenutzten `GEMINI_API_KEY`-Platzhalter. Keine Secrets im Repo anlegen.
+9. **Windows-only-Annahmen:** hartkodierte `\\`-Pfade (Alben), PowerShell für CreationTime, Backslash-/Separator-Erkennung über `includes('\\')`.
+10. **Extension-Listen müssen synchron bleiben:** JPG-Erkennung `.jpg/.jpeg`; Video-Erkennung `.mp4 .mov .m4v .avi .3gp .mpg .mts`. Sie existieren mehrfach (main.cjs Download + move, App.tsx Anzeige-Typ). Bei neuen Formaten alle Stellen prüfen.
+11. **Der Crawler hängt an der Google-Photos-Web-DOM.** Änderungen an Google (aria-labels, Tastenkürzel Shift+D / i / Pfeiltasten, Panel-Layout >70 % Viewportbreite) können den Scraper brechen. `extractCurrentImageInfo` ist die zentrale Stelle.
+12. **Kein automatisches Timeout für den gesamten Download** – nur Start-Timeout 15 s und 3-s-Timeout beim Scraping. Hängende Downloads können die 5-Slot-Grenze blockieren.
+13. **DB wird bei Download-Complete nur im Speicher aktualisiert**, persistiert erst durch nachfolgendes `saveDatabase()` (Autosave 30 s / Tageswechsel / Session-Ende). Ein harter Absturz kann die letzten Sekunden verlieren (dafür gibt es die Backups alle 10 min).
+
+---
+
+## 15. Konventionen & Arbeitsanweisungen für Agenten
+
+1. **AGENTS.md aktualisieren bei jeder Änderung** (siehe Kopf). Betroffene Abschnitte anpassen, keine widersprüchlichen Angaben stehen lassen.
+2. **Sprache:** UI-Texte und Logs auf Deutsch; Code-Bezeichner Englisch. Bestehenden Stil nachahmen.
+3. **Keine neuen Abhängigkeiten**, wenn es ohne geht. Wenn doch, `package.json` anpassen und hier dokumentieren. Browser-only-Libs im Renderer vermeiden (Node-Zugriff nur über IPC).
+4. **Sicherheit:** `contextIsolation: true`, `nodeIntegration: false`, `sandbox: false`, `webviewTag: true` sind gesetzt. Keine Secrets/Telemetrie/Netzwerkaufrufe hinzufügen (außer Google Photos im Webview).
+5. **Hash-Gate nie umgehen.** Jegliche Datei-Mutation (Move/Rename/Rewrite) muss `expectedHash` berücksichtigen, sonst gehen Daten verloren.
+6. **DB-Schema-Erweiterungen** erfordern: `types.ts` (`DatabaseEntry`/`FileDatabase`), beide Valid-Key-Listen (Abschnitt 8.6), ggf. CSV-Spalten, ggf. Migration + `hashScheme`-Erhöhung, und diesen AGENTS.md-Abschnitt.
+7. **Neue IPC-Funktionen** an drei Stellen ergänzen (main.cjs, preload.cjs, types.ts) und in Abschnitt 11 dokumentieren.
+8. **CommonJS-Beibehaltung** in `main.cjs`/`preload.cjs`.
+9. **Vor Abschluss einer Aufgabe:** `npm run build` ausführen (TypeScript-Check). Bei UI-/Ablaufsänderungen zusätzlich manuell per `npm run electron:dev` testen, sofern möglich.
+10. **Git:** Nicht committen/pushen, außer der Nutzer fordert es ausdrücklich. Commits auf Deutsch/Englisch gemischt üblich (Präfixe `feat:`, `fix:`, `docs:`, `chore:`).
+
+---
+
+## 16. Glossar
+
+| Begriff | Bedeutung |
+|---|---|
+| **webDate** | Aufnahmedatum, das aus der Google-Photos-Sidebar gescraped wird; bestimmt den Zielordner |
+| **finalDate** | Tatsächlich geschriebenes Datum (Web-Datum, ggf. mit Sekunden aus EXIF) |
+| **sourceHash** | SHA-256 des Rohdownloads vor Metadaten-Rewrite (stabil) |
+| **hash** | SHA-256 der Datei auf der Platte nach Rewrite (änderbar durch Korrekturen) |
+| **trusted** | Metadaten-Scrape gilt als verlässlich; sonst keine Rewrites/Korrekturen |
+| **Orphan / vermisst** | DB-Eintrag mit `missingSince`, Datei fehlt lokal |
+| **corrupt** | Datei mit 0 Bytes oder Lesefehler (`integrityStatus === 'corrupt'`) |
+| **Turbo-Backup** | Der parallele Crawler-Loop (max. 5 gleichzeitige Downloads) |
+| **Batch** | 1000 Loop-Iterationen, danach Sicherheits-Checkpoint |
+| **scannedDays** | `YYYY-MM-DD` → Scan-Zeitpunkt; Grundlage der Heatmap und Orphan-Prüfung |
+| **Hash-Gate** | Pflicht-Hash-Vergleich vor Datei-Mutation |
+| **Stale Panel** | Sidebar zeigt verzögert noch Daten des vorherigen Fotos |
+
+---
+
+## 17. Kurz-Checkliste für typische Aufgaben
+
+- **Neues Feature in der Backup-Schleife:** `App.tsx` (`runBackupSession`), ggf. `logic/crawlerActions.ts`; Parallelität/Batch/Autosave-Mechanik beachten; Log via `addLog`; AGENTS.md Abschnitt 4/12.
+- **Neuer Metadaten-Typ:** Main-Prozess (Download-`done`-Handler + `move-and-update-file`), Extension-Listen, `DownloadResult`/`DatabaseEntry`-Typen, AGENTS.md Abschnitt 5/7.
+- **Neue Wartungs-/Prüffunktion:** Handler in `main.cjs`, Bridge + Typ, Modal in `components/ActionModals.tsx`, Einbindung in App.tsx, AGENTS.md Abschnitt 8.
+- **DB-Feld:** siehe Konvention 6.
+- **Crawler-Anpassung (Google-DOM):** `logic/crawlerActions.ts` + `utils/exifUtils.ts` (Datumsformat), Trust-Detektor in App.tsx prüfen; AGENTS.md Abschnitt 9/14.11.
