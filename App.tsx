@@ -1204,16 +1204,8 @@ const App: React.FC = () => {
                                 const oldDateStr = new Date(existingEntry.timestamp).toLocaleString();
                                 const newDateStr = new Date(webTimestamp).toLocaleString();
 
-                                let plausible = true;
-                                if (existingEntry.originalDate) {
-                                    const od = parseExifDateToDate(existingEntry.originalDate);
-                                    if (od && Math.abs(webTimestamp - od.getTime()) > 30 * 24 * 60 * 60 * 1000) plausible = false;
-                                }
-
                                 if (!trustInfo.trusted) {
                                     addLog(`⚠️ Datums-Korrektur übersprungen (${trustInfo.reason}): ${existingEntry.filename} ${oldDateStr} -> ${newDateStr}`, 'warning');
-                                } else if (!plausible) {
-                                    addLog(`⚠️ Datums-Korrektur übersprungen (unplausibel >30 Tage): ${existingEntry.filename} ${oldDateStr} -> ${newDateStr}`, 'warning');
                                 } else if (!existingEntry.hash) {
                                     const hashRes = await window.electron.computeFileHash({ basePath: exportPath, filename: existingEntry.filename, timestamp: existingEntry.timestamp });
                                     if (hashRes.success && hashRes.hash) {
