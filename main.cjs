@@ -678,55 +678,90 @@ ipcMain.handle('check-db-integrity', async (event, { basePath, files, onlySubset
     return { missing, duplicates, updates, sizeUpdates, total: entries.length };
 });
 
-// NEU: Sucht nach Dateien wie "IMG_1234 (1).jpg", wo "IMG_1234.jpg" NICHT existiert
+// Sucht Dateien wie "IMG_1234 (1).jpg", deren Basisname "IMG_1234.jpg" NICHT existiert.
+// Sicherheitskriterium: Der Google-Originalname muss OHNE Endung und case-insensitiv zum
+// Zielnamen passen. Echte Google-Namen wie "DB 2025 (970).JPG" werden dadurch nie angefasst.
 ipcMain.handle('find-renamable-files', async (event, { basePath, files }) => {
     const candidates = [];
     const entries = Object.entries(files);
-    
+
     // Regex für "Name (ZAHL).ext"
     const suffixRegex = /^(.*?)\s\(\d+\)(\.[^.]+)$/;
 
+    const stats = {
+        nTotal: 0,           // Einträge mit "(n)" im Namen
+        legitNames: 0,       // "(n)" gehört zum echten Google-Namen
+        noName: 0,           // kein originalName gespeichert
+        nameMismatch: 0,     // originalName passt nicht zum Basisnamen
+        currentMissing: 0,   // "(n)"-Datei liegt nicht auf der Platte
+        collisionPair: 0,    // Basisdatei existiert ebenfalls (Duplikat-Verdacht)
+        targetMissing: 0     // Basisname ist frei -> Kandidat
+    };
+
+    const fileStem = (name) => {
+        const base = path.basename(name);
+        const ext = path.extname(base);
+        return ext ? base.slice(0, -ext.length) : base;
+    };
+
     for (const [id, entry] of entries) {
         const match = entry.filename.match(suffixRegex);
-        if (match) {
-            // Es ist ein Kandidat: "Name (1).jpg"
-            const cleanName = match[1] + match[2]; // "Name.jpg"
-            
-            const dateObj = new Date(entry.timestamp);
-            const year = dateObj.getFullYear().toString();
-            const month = (dateObj.getMonth() + 1).toString().padStart(2, '0');
-            
-            const dir = path.join(basePath, year, month);
-            const currentPath = path.join(dir, entry.filename);
-            const targetPath = path.join(dir, cleanName);
-            
-            // Check 1: Existiert die aktuelle Datei überhaupt?
-            if (!fs.existsSync(currentPath)) continue;
+        if (!match) continue;
 
-            // Check 2: Existiert die Zieldatei (ohne Suffix)?
-            // Wenn NEIN, dann KÖNNTEN wir umbenennen.
-            if (!fs.existsSync(targetPath)) {
-                
-                // Check 3: Sicherheits-Check via Original-Name (MUSS vorhanden und identisch sein)
-                // Wir benennen NUR um, wenn wir sicher wissen, wie die Datei eigentlich heißen soll.
-                if (!entry.originalName || entry.originalName !== cleanName) {
-                    continue; 
-                }
+        stats.nTotal++;
+        const cleanName = match[1] + match[2]; // "Name.jpg"
 
-                candidates.push({
-                    id,
-                    currentName: entry.filename,
-                    newName: cleanName,
-                    timestamp: entry.timestamp,
-                    path: path.join(year, month) // Nur für Info
-                });
-            }
+        // Echter Google-Name mit "(n)" -> niemals umbenennen
+        if (entry.originalName && entry.originalName.toLowerCase() === entry.filename.toLowerCase()) {
+            stats.legitNames++;
+            continue;
         }
+
+        if (!entry.originalName) {
+            stats.noName++;
+            continue;
+        }
+
+        // Namensprüfung: Stamm ohne Endung, case-insensitiv (deckt .JPG/.jpg und HEIC->jpg ab)
+        if (fileStem(entry.originalName).toLowerCase() !== fileStem(cleanName).toLowerCase()) {
+            stats.nameMismatch++;
+            continue;
+        }
+
+        const dateObj = new Date(entry.timestamp);
+        const year = dateObj.getFullYear().toString();
+        const month = (dateObj.getMonth() + 1).toString().padStart(2, '0');
+
+        const dir = path.join(basePath, year, month);
+        const currentPath = path.join(dir, entry.filename);
+        const targetPath = path.join(dir, cleanName);
+
+        // Check 1: Existiert die "(n)"-Datei überhaupt?
+        if (!fs.existsSync(currentPath)) {
+            stats.currentMissing++;
+            continue;
+        }
+
+        // Check 2: Basisdatei existiert bereits -> Duplikat-Verdacht, kein Rename
+        if (fs.existsSync(targetPath)) {
+            stats.collisionPair++;
+            continue;
+        }
+        stats.targetMissing++;
+
+        candidates.push({
+            id,
+            currentName: entry.filename,
+            newName: cleanName,
+            timestamp: entry.timestamp,
+            path: path.join(year, month) // Nur für Info
+        });
     }
-    return candidates;
+
+    return { candidates, stats };
 });
 
-ipcMain.handle('rename-file', async (event, { basePath, oldName, newName, timestamp }) => {
+ipcMain.handle('rename-file', async (event, { basePath, oldName, newName, timestamp, expectedHash }) => {
     const dateObj = new Date(timestamp);
     const year = dateObj.getFullYear().toString();
     const month = (dateObj.getMonth() + 1).toString().padStart(2, '0');
@@ -736,14 +771,24 @@ ipcMain.handle('rename-file', async (event, { basePath, oldName, newName, timest
     const newPath = path.join(dir, newName);
 
     try {
-        if (!fs.existsSync(oldPath)) return false;
-        if (fs.existsSync(newPath)) return false; // Sicherheit
-        
+        if (!fs.existsSync(oldPath)) return { success: false, error: 'Quelldatei fehlt' };
+        if (fs.existsSync(newPath)) return { success: false, error: 'Zielname bereits belegt' };
+
+        if (expectedHash) {
+            const actualHash = await getFileHash(oldPath);
+            if (actualHash !== expectedHash) {
+                appendLog('error', `RENAME HASH_MISMATCH: ${oldPath} (erwartet=${expectedHash.substring(0,12)}… ist=${actualHash.substring(0,12)}…)`);
+                return { success: false, error: 'HASH_MISMATCH' };
+            }
+        }
+
         fs.renameSync(oldPath, newPath);
-        return true;
+        appendLog('info', `Umbenannt: ${oldPath} -> ${newPath}${expectedHash ? ' [Hash ok]' : ''}`);
+        return { success: true };
     } catch (e) {
         console.error("Rename failed", e);
-        return false;
+        appendLog('error', `RENAME fehlgeschlagen: ${oldPath} (${e.message})`);
+        return { success: false, error: e.message };
     }
 });
 
@@ -752,7 +797,7 @@ ipcMain.handle('clear-session-cache', async () => {
 });
 
 ipcMain.handle('prepare-download', async (event, config) => {
-    nextDownloadConfig = { active: true, id: config.id, targetDir: config.targetDir, dateTimestamp: config.dateTimestamp, flatStructure: config.flatStructure || false };
+    nextDownloadConfig = { active: true, id: config.id, targetDir: config.targetDir, dateTimestamp: config.dateTimestamp, flatStructure: config.flatStructure || false, trusted: config.trusted !== false };
     return true;
 });
 

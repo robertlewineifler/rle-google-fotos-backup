@@ -147,6 +147,16 @@ export interface RenamableFile {
     path: string; // Relativer Pfad
 }
 
+export interface RenamableStats {
+    nTotal: number;          // Einträge mit "(n)" im Namen
+    legitNames: number;      // "(n)" gehört zum echten Google-Namen
+    noName: number;          // kein originalName gespeichert
+    nameMismatch: number;    // originalName passt nicht zum Basisnamen
+    currentMissing: number;  // "(n)"-Datei liegt nicht auf der Platte
+    collisionPair: number;   // Basisdatei existiert ebenfalls (Duplikat-Verdacht)
+    targetMissing: number;   // Basisname ist frei -> Kandidat
+}
+
 // Global Window Interface für Electron
 declare global {
   interface Window {
@@ -163,7 +173,7 @@ declare global {
       saveDatabase: (filePath: string, data: FileDatabase) => Promise<boolean>;
       saveTextFile: (filePath: string, content: string) => Promise<{success: boolean, path?: string, error?: string}>; // NEU: CSV Export
       checkIntegrity: (basePath: string, files: Record<string, DatabaseEntry>) => Promise<IntegrityResult>;
-      findRenamableFiles: (basePath: string, files: Record<string, DatabaseEntry>) => Promise<RenamableFile[]>;
+      findRenamableFiles: (basePath: string, files: Record<string, DatabaseEntry>) => Promise<{ candidates: RenamableFile[], stats: RenamableStats }>;
       verifyFileIntegrityBatch: (basePath: string, files: {id: string, filename: string, timestamp: number}[]) => Promise<Record<string, 'ok' | 'corrupt'>>; // NEU
 
       // Download
@@ -175,7 +185,7 @@ declare global {
       
       // Datei Operationen
       deleteFile: (config: { basePath: string, filename: string, timestamp: number }) => Promise<boolean>;
-      renameFile: (config: { basePath: string, oldName: string, newName: string, timestamp: number }) => Promise<boolean>;
+      renameFile: (config: { basePath: string, oldName: string, newName: string, timestamp: number, expectedHash?: string }) => Promise<{ success: boolean, error?: string }>;
       checkFileExists: (config: { basePath: string, filename: string, timestamp: number }) => Promise<boolean>;
       computeFileHash: (config: { basePath: string, filename: string, timestamp: number }) => Promise<{ success: boolean, hash?: string, error?: string }>;
       

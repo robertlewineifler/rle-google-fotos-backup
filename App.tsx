@@ -544,11 +544,29 @@ const App: React.FC = () => {
       addLog("Suche nach unnötigen Nummerierungen...", 'info');
       
       try {
-          const candidates = await window.electron.findRenamableFiles(exportPath, dbRef.current.files);
+          const result = await window.electron.findRenamableFiles(exportPath, dbRef.current.files);
+          const candidates = result?.candidates || [];
+          const s = result?.stats;
+
           if (candidates.length > 0) {
               setRenamableFiles(candidates);
               setShowRenameModal(true);
               addLog(`${candidates.length} Dateien können bereinigt werden.`, 'info');
+          } else if (s) {
+              addLog(`Bereinigung: 0 Kandidaten. ${s.nTotal} Namen mit "(n)": ${s.legitNames} originale Google-Namen (geschützt), ${s.collisionPair} Kollisions-Kopien (Basisdatei existiert), ${s.nameMismatch} ohne Namensbezug, ${s.noName} ohne Originalname, ${s.currentMissing} Datei fehlt.`, 'success');
+              const msg =
+                  `Keine sicheren Umbenennungen gefunden.\n\n` +
+                  `${s.nTotal} Dateinamen mit "(n)":\n` +
+                  `• ${s.legitNames} sind originale Google-Namen (werden geschützt)\n` +
+                  `• ${s.collisionPair} sind Kollisions-Kopien, Basisdatei existiert bereits\n` +
+                  `• ${s.nameMismatch} ohne passenden Originalnamen\n` +
+                  `• ${s.noName} ohne Originalname\n` +
+                  `• ${s.currentMissing} Datei(en) fehlen lokal\n\n` +
+                  `Inhaltsgleiche Duplikate findest du über "Datenbank prüfen" → "Duplikate lösen".\n\n` +
+                  `Duplikat-Prüfung jetzt öffnen?`;
+              if (confirm(msg)) {
+                  openIntegrityMenu();
+              }
           } else {
               addLog("Keine Dateien zur Bereinigung gefunden.", 'success');
               alert("Keine Dateien gefunden, bei denen die Original-Datei fehlt UND der Original-Name sicher übereinstimmt.");
@@ -565,19 +583,22 @@ const App: React.FC = () => {
       let successCount = 0;
       for (const item of renamableFiles) {
           try {
-              const success = await window.electron.renameFile({
+              const res = await window.electron.renameFile({
                   basePath: exportPath,
                   oldName: item.currentName,
                   newName: item.newName,
-                  timestamp: item.timestamp
+                  timestamp: item.timestamp,
+                  expectedHash: dbRef.current.files[item.id]?.hash
               });
               
-              if (success) {
+              if (res.success) {
                   // DB Update
                   if (dbRef.current.files[item.id]) {
                       dbRef.current.files[item.id].filename = item.newName;
                   }
                   successCount++;
+              } else {
+                  addLog(`Umbenennen fehlgeschlagen: ${item.currentName} (${res.error || 'unbekannt'})`, 'warning');
               }
           } catch (e) {
               console.error(e);
