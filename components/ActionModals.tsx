@@ -253,8 +253,8 @@ export const IntegrityReportModal: React.FC<IntegrityReportModalProps> = ({
              if (files['scannedRanges' as any]) legacyCount++; 
              const validKeys = new Set([
                   'filename', 'timestamp', 'originalDate', 'originalName', 
-                  'savedAt', 'downloadedAt', 'scannedAt', 'hash', 'missingSince', 'id',
-                  'integrityStatus', 'integrityCheckedAt'
+                  'savedAt', 'downloadedAt', 'scannedAt', 'hash', 'sourceHash', 'missingSince', 'id',
+                  'integrityStatus', 'integrityCheckedAt', 'size'
              ]);
              for(const id in files) {
                   const entry = files[id];

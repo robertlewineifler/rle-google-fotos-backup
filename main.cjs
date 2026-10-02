@@ -288,7 +288,12 @@ function createWindow() {
             resultPayload.path = savePath;
 
             // --- METADATA ---
+            let sourceHash = null;
             let hash = null;
+
+            // Quell-Fingerprint: Rohzustand direkt nach Download/ZIP-Extraktion, VOR dem Metadaten-Rewrite.
+            // Bleibt stabil, auch wenn lokal ein anderes Zieldatum hineingeschrieben wird.
+            try { sourceHash = await getFileHash(savePath); } catch(e) { console.error("SourceHash Error", e); }
             
             const isJpg = ['.jpg', '.jpeg'].includes(ext);
             const isVideo = ['.mp4', '.mov', '.m4v', '.avi', '.3gp', '.mpg', '.mts'].includes(ext);
@@ -336,6 +341,7 @@ function createWindow() {
             // Ergebnis finalisieren
             resultPayload.success = true;
             resultPayload.metadataWritten = trusted;
+            resultPayload.sourceHash = sourceHash;
             resultPayload.originalExifDate = originalDateObj ? formatExifLike(originalDateObj) : null;
             resultPayload.hash = hash;
             resultPayload.finalDateTimestamp = finalDate.getTime();
@@ -349,7 +355,9 @@ function createWindow() {
           resultPayload.error = globalErr.message;
       } finally {
           // WICHTIG: Sende IMMER eine Antwort, damit der Slot im React-Frontend freigegeben wird.
-          appendLog(resultPayload.success ? 'success' : 'error', `Download ${state}: ${finalFilename}${resultPayload.error ? ' error=' + resultPayload.error : ''}`);
+          const srcLog = resultPayload.sourceHash ? resultPayload.sourceHash.substring(0, 10) + '…' : '-';
+          const fileLog = resultPayload.hash ? resultPayload.hash.substring(0, 10) + '…' : '-';
+          appendLog(resultPayload.success ? 'success' : 'error', `Download ${state}: ${finalFilename} (src=${srcLog} file=${fileLog})${resultPayload.error ? ' error=' + resultPayload.error : ''}`);
           mainWindow.webContents.send('download-complete', resultPayload);
       }
     });

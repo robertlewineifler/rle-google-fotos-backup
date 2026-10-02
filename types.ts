@@ -74,7 +74,8 @@ export interface DownloadResult {
     path: string;
     error?: string;
     originalExifDate?: string; // Raw Exif String
-    hash?: string; // SHA-256 Hash
+    hash?: string; // SHA-256 nach Metadaten-Rewrite (Datei auf der Platte)
+    sourceHash?: string; // SHA-256 des Rohdownloads vor dem Rewrite
     finalDateTimestamp?: number; // Das tatsächlich geschriebene Datum (ggf. mit Sekunden aus Original)
     metadataWritten?: boolean; // NEU: false => Metadaten wurden bewusst nicht angefasst
 }
@@ -102,7 +103,8 @@ export interface DatabaseEntry {
     savedAt: number; // Veraltet (Legacy), wird beibehalten
     downloadedAt?: number; // Neu: Wann wurde die Datei zuletzt heruntergeladen
     scannedAt?: number;    // Neu: Wann wurde die Datei zuletzt online gesichtet
-    hash?: string;         // SHA-256 Hash des Datei-Inhalts
+    hash?: string;         // SHA-256 der Datei WIE SIE AUF DER PLATTE LIEGT (nach Metadaten-Rewrite)
+    sourceHash?: string;   // SHA-256 des Google-Rohdownloads VOR jedem lokalen Rewrite (stabiler Quell-Fingerprint)
     size?: number;         // NEU: Dateigröße in Bytes
     missingSince?: number; // Timestamp, wann das Bild erstmals nicht mehr gefunden wurde
     integrityStatus?: 'ok' | 'corrupt'; // NEU: Ergebnis des File-Checks
@@ -117,6 +119,7 @@ export interface FileDatabase {
     
     scannedDays?: Record<string, number>; // NEU: 'YYYY-MM-DD' -> Timestamp des letzten Scans
     scannedRanges?: ScannedRange[]; // VERALTET (Legacy support)
+    hashScheme?: number; // NEU: 2 = sourceHash/hash getrennt (Migration abgeschlossen)
 }
 
 export interface IntegrityError {

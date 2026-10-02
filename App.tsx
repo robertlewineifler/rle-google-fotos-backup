@@ -259,6 +259,7 @@ const App: React.FC = () => {
                           scannedAt: Date.now(), 
                           originalDate: result.originalExifDate, 
                           hash: result.hash,
+                          sourceHash: result.sourceHash,
                           // WICHTIG: Integrity Status NICHT auf 'ok' setzen, sondern offen lassen (undefined).
                           // Damit gilt die Datei als "ungeprüft" im Dashboard und kann validiert werden.
                       };
@@ -316,7 +317,29 @@ const App: React.FC = () => {
             dbRef.current.basePath = basePath;
             // Falls alte DB ohne scannedDays, initialisieren
             if (!dbRef.current.scannedDays) dbRef.current.scannedDays = {};
-            
+
+            // EINMALIGE HASH-MIGRATION (Schema 2):
+            // Bisheriger "hash" war der Roh-Hash VOR dem Metadaten-Rewrite -> jetzt sourceHash.
+            // Der aktuelle Datei-Hash wird lazy nachgezogen (Hash-Gate / Integritätsprüfung).
+            if (loadedDb.hashScheme !== 2) {
+                let migrated = 0;
+                for (const id of Object.keys(loadedDb.files)) {
+                    const entry = loadedDb.files[id];
+                    if (entry.hash && !entry.sourceHash) {
+                        entry.sourceHash = entry.hash;
+                        delete entry.hash;
+                        migrated++;
+                    }
+                }
+                loadedDb.hashScheme = 2;
+                try {
+                    await window.electron.saveDatabase(filePath, { ...loadedDb, basePath: '.' });
+                    setTimeout(() => addLog(`🔀 Hash-Migration: ${migrated} Einträge (alter Hash -> sourceHash) gespeichert.`, 'info'), 700);
+                } catch (migErr) {
+                    console.error("Hash-Migration konnte nicht gespeichert werden", migErr);
+                }
+            }
+
             processedIdsRef.current = new Set(Object.keys(loadedDb.files));
             setScannedDays(dbRef.current.scannedDays);
             setExportPath(basePath);
@@ -350,7 +373,8 @@ const App: React.FC = () => {
             dbFilePath: filePath,
             lastUpdated: Date.now(),
             files: {},
-            scannedDays: {} // Initial leer
+            scannedDays: {}, // Initial leer
+            hashScheme: 2
         };
         processedIdsRef.current = new Set();
         setScannedDays({});
@@ -580,7 +604,7 @@ const App: React.FC = () => {
       // 2. Entries bereinigen
       const validKeys = new Set([
         'filename', 'timestamp', 'originalDate', 'originalName', 
-        'savedAt', 'downloadedAt', 'scannedAt', 'hash', 'missingSince', 'id',
+        'savedAt', 'downloadedAt', 'scannedAt', 'hash', 'sourceHash', 'missingSince', 'id',
         'integrityStatus', 'integrityCheckedAt', 'size' // NEU: 'size' is valid
       ]);
       
@@ -722,7 +746,7 @@ const App: React.FC = () => {
       setRenamableFiles([]); 
       
       // 3. Clear Refs
-      dbRef.current = { basePath: '', lastUpdated: 0, files: {}, scannedDays: {} };
+      dbRef.current = { basePath: '', lastUpdated: 0, files: {}, scannedDays: {}, hashScheme: 2 };
       processedIdsRef.current = new Set();
       activeDownloadsRef.current = 0;
       setActiveDownloadsCount(0);

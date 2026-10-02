@@ -28,7 +28,7 @@ export const exportDatabaseToCsv = async (files: Record<string, DatabaseEntry>, 
 
     const headers = [
         "ID", "Filename", "Original Name", "Web Date (Readable)", "Timestamp", "Original Date", 
-        "Hash", "Integrity Status", "Saved At", "Downloaded At", "Scanned At", "Missing Since"
+        "Hash", "Source Hash", "Integrity Status", "Saved At", "Downloaded At", "Scanned At", "Missing Since"
     ];
 
     const csvRows = ['\uFEFF' + headers.join(';')];
@@ -45,6 +45,7 @@ export const exportDatabaseToCsv = async (files: Record<string, DatabaseEntry>, 
             file.timestamp, 
             `"${file.originalDate || ''}"`, 
             `"${file.hash || ''}"`,
+            `"${file.sourceHash || ''}"`,
             `"${statusStr}"`,
             file.savedAt ? new Date(file.savedAt).toLocaleString() : '',
             file.downloadedAt ? new Date(file.downloadedAt).toLocaleString() : '',
