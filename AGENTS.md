@@ -21,7 +21,7 @@ Eine lokale Windows-Desktop-App, die die eigene **Google-Fotos-Bibliothek** sich
 - Alles bleibt lokal: **keine Cloud, keine Telemetrie, keine externen Server** (einzige Ausnahme: geladene Webseite photos.google.com im Webview und Tailwind-CDN im index.html).
 
 ### Grundprinzip / Warum Crawling statt API?
-`services/googlePhotosService.ts` enthält noch Alt-Code für die Google Photos Library API. Diese wird **nicht genutzt** und ist aktuell funktionslos (siehe Abschnitt 13 „Legacy/Tote Pfade“). Der eigentliche Download-Mechanismus ist der Webview-Crawler + Electron-`will-download`-Interception.
+Der Download-Mechanismus ist ausschließlich der **Webview-Crawler + Electron-`will-download`-Interception**. Ein früherer Google-Photos-Library-API-Ansatz wurde beim Cleanup (Phase 1) vollständig entfernt (Datei `services/googlePhotosService.ts`, IPC-Kanal `google-api-request`, zugehörige Typen). Nicht wieder einführen.
 
 ---
 
@@ -66,14 +66,13 @@ index.html                   HTML-Shell, Tailwind-CDN, Importmap, Custom-Scrollb
 index.tsx                    React-Bootstrap (createRoot)
 declarations.d.ts            Modul-/JSX-Deklarationen (webview, *.png, piexifjs)
 logic/crawlerActions.ts      DOM-Steuerung im Webview (Tastatur-Events, Metadaten-Scraping)
-logic/databaseUtils.ts       CSV-Export, Duplikat-Auflösung (Orphan-Delete-Funktion ungenutzt)
+logic/databaseUtils.ts       CSV-Export, Duplikat-Auflösung
 utils/exifUtils.ts           Datums-Parser (Google-Sidebar-Texte, EXIF), ISO-Datums-Helfer
-services/googlePhotosService.ts  LEGACY/TOT: Google-Photos-Library-API-Helfer (nicht angebunden)
 components/StartupScreen.tsx     Startbildschirm (DB laden/neu anlegen)
 components/ActionModals.tsx      CorrectionModal, IntegrityReportModal, RenameModal, AlbumDownloadModal
 components/ScanHeatmap.tsx       Scan-Historie-Heatmap (4 Ansichtsmodi)
 public/icon.ico, assets/icon.png Icons (Packaging/UI)
-.dev.local                   Platzhalter GEMINI_API_KEY (ungenutzt, nicht verwenden)
+.env.local                   Platzhalter GEMINI_API_KEY (ungenutzt, nicht verwenden)
 dist/, release/              Build-Artefakte (via .gitignore ausgeschlossen)
 ```
 
@@ -307,7 +306,6 @@ Google Photos aktualisiert das Info-Sidepanel asynchron verzögert beim Navigier
   - Namens-/Datums-Korrekturen werden mit Warnlog übersprungen.
   - `rememberTrueMeta` speichert den Web-Timestamp dann nicht als verlässlich.
 - `handleSingleDownload` nutzt diesen Detektor **nicht** (immer `trusted=true`).
-- `panelSignature` wird vom Scraper berechnet, aktuell aber im Frontend nicht verwendet (Reserve).
 
 ---
 
@@ -329,7 +327,6 @@ Alle Kanalnamen exakt so (main.cjs `ipcMain`):
 |---|---|---|---|
 | `selectDirectory` | `select-directory` | invoke | Ordner-Dialog |
 | `selectDatabaseFile` | `select-database-file` | invoke | JSON-Datei-Dialog |
-| `createDirectory` | `create-directory` | invoke | Ordner anlegen |
 | `clearSessionCache` | `clear-session-cache` | invoke | `session.clearStorageData()` |
 | `logToConsole` | `log-to-console` | send | Log in Konsole + Datei |
 | `openLogsFolder` | `open-logs-folder` | invoke | Log-Ordner öffnen |
@@ -350,7 +347,6 @@ Alle Kanalnamen exakt so (main.cjs `ipcMain`):
 | `computeFileHash` | `compute-file-hash` | invoke | SHA-256 |
 | `moveAndUpdateFile` | `move-and-update-file` | invoke | Verschieben + Metadaten (Hash-Gate) |
 | `showItemInFolder` | `show-item-in-folder` | invoke | Explorer |
-| `googleApiRequest` | `google-api-request` | invoke | **KEIN Handler in main.cjs vorhanden → toter Kanal** |
 
 - Die TS-Typisierung liegt in `types.ts` im `declare global { interface Window { electron: … } }`. **Neue IPC-Funktionen immer an drei Stellen ergänzen: `main.cjs` (Handler), `preload.cjs` (Bridge), `types.ts` (Typ).**
 - `checkIntegrity` wird in der Typisierung noch mit `(basePath, files)` beschrieben, tatsächlich ruft App.tsx `(basePath, files, onlySubset)` mit `@ts-ignore`. Bei Gelegenheit Typisierung nachziehen.
@@ -394,19 +390,33 @@ Alle Kanalnamen exakt so (main.cjs `ipcMain`):
 
 Diese Punkte sind bewusst dokumentiert, damit Agenten sie nicht für funktionierenden Code halten:
 
-1. **`services/googlePhotosService.ts` ist tot.** Der zugehörige `google-api-request`-IPC-Handler fehlt in `main.cjs`. Aufrufe würden fehlschlagen. Downloads laufen ausschließlich über den Webview-Crawler.
-2. **Unbenutzte Exporte:** `formatDateForExif`, `blobToDataURL`, `dataURLtoBlob` (exifUtils.ts), `deleteOrphansFromDisk` (databaseUtils.ts), `determineAlbumName` (crawlerActions.ts), `AppState` (types.ts), `panelSignature` (Rückgabe, aber ungenutzt).
-3. **`scannedRanges`** ist Legacy (Root-Feld). Nur noch für Migration/Bereinigung relevant.
-4. **Doppelte Valid-Key-Listen** für die Legacy-Bereinigung (App.tsx + ActionModals.tsx) – synchron halten!
-5. **`basePath` wird beim Speichern auf `"."` gesetzt** – der echte Basispfad kommt beim Laden aus dem Dateipfad. Nicht „korrigieren“, das ist Absicht (portable DB).
-6. **`index.html`** lädt eine Importmap mit React 19 von esm.sh, obwohl package.json React 18 nutzt; Vite bundelt ohnehin. Harmlos, aber nicht als Vorbild nehmen.
-7. **Tailwind läuft über CDN** (`cdn.tailwindcss.com`) – die App braucht Internetzugang zum Laden der UI-Styles (Webview braucht das ohnehin).
-8. **`.env.local`** enthält nur einen ungenutzten `GEMINI_API_KEY`-Platzhalter. Keine Secrets im Repo anlegen.
-9. **Windows-only-Annahmen:** hartkodierte `\\`-Pfade (Alben), PowerShell für CreationTime, Backslash-/Separator-Erkennung über `includes('\\')`.
-10. **Extension-Listen müssen synchron bleiben:** JPG-Erkennung `.jpg/.jpeg`; Video-Erkennung `.mp4 .mov .m4v .avi .3gp .mpg .mts`. Sie existieren mehrfach (main.cjs Download + move, App.tsx Anzeige-Typ). Bei neuen Formaten alle Stellen prüfen.
-11. **Der Crawler hängt an der Google-Photos-Web-DOM.** Änderungen an Google (aria-labels, Tastenkürzel Shift+D / i / Pfeiltasten, Panel-Layout >70 % Viewportbreite) können den Scraper brechen. `extractCurrentImageInfo` ist die zentrale Stelle.
-12. **Kein automatisches Timeout für den gesamten Download** – nur Start-Timeout 15 s und 3-s-Timeout beim Scraping. Hängende Downloads können die 5-Slot-Grenze blockieren.
-13. **DB wird bei Download-Complete nur im Speicher aktualisiert**, persistiert erst durch nachfolgendes `saveDatabase()` (Autosave 30 s / Tageswechsel / Session-Ende). Ein harter Absturz kann die letzten Sekunden verlieren (dafür gibt es die Backups alle 10 min).
+1. **Toter Code wurde in Cleanup-Phase 1 entfernt:** `services/googlePhotosService.ts` (Library-API), IPC `google-api-request` + `create-directory`, `deleteOrphansFromDisk`, `determineAlbumName`, `formatDateForExif`, `blobToDataURL`, `dataURLtoBlob`, `AppState`, `GooglePhotoAlbum`, `GoogleMediaItem`, `foundInSidePanel`/`panelSignature`, unbenutzte Imports, `public/index.css`, `metadata.json`. Nicht wieder einführen.
+2. **`scannedRanges`** ist Legacy (Root-Feld). Nur noch für Migration/Bereinigung relevant.
+3. **Doppelte Valid-Key-Listen** für die Legacy-Bereinigung (App.tsx + ActionModals.tsx) – synchron halten!
+4. **`basePath` wird beim Speichern auf `"."` gesetzt** – der echte Basispfad kommt beim Laden aus dem Dateipfad. Nicht „korrigieren“, das ist Absicht (portable DB).
+5. **`index.html`** lädt eine Importmap mit React 19 von esm.sh, obwohl package.json React 18 nutzt; Vite bundelt ohnehin. Harmlos, aber nicht als Vorbild nehmen.
+6. **Tailwind läuft über CDN** (`cdn.tailwindcss.com`) – die App braucht Internetzugang zum Laden der UI-Styles (Webview braucht das ohnehin).
+7. **`.env.local`** enthält nur einen ungenutzten `GEMINI_API_KEY`-Platzhalter. Keine Secrets im Repo anlegen.
+8. **Windows-only-Annahmen:** hartkodierte `\\`-Pfade (Alben), PowerShell für CreationTime, Backslash-/Separator-Erkennung über `includes('\\')`.
+9. **Extension-Listen müssen synchron bleiben:** JPG-Erkennung `.jpg/.jpeg`; Video-Erkennung `.mp4 .mov .m4v .avi .3gp .mpg .mts`. Sie existieren mehrfach (main.cjs Download + move, App.tsx Anzeige-Typ). Bei neuen Formaten alle Stellen prüfen.
+10. **Der Crawler hängt an der Google-Photos-Web-DOM.** Änderungen an Google (aria-labels, Tastenkürzel Shift+D / i / Pfeiltasten, Panel-Layout >70 % Viewportbreite) können den Scraper brechen. `extractCurrentImageInfo` ist die zentrale Stelle.
+11. **Kein automatisches Timeout für den gesamten Download** – nur Start-Timeout 15 s und 3-s-Timeout beim Scraping. Hängende Downloads können die 5-Slot-Grenze blockieren.
+12. **DB wird bei Download-Complete nur im Speicher aktualisiert**, persistiert erst durch nachfolgendes `saveDatabase()` (Autosave 30 s / Tageswechsel / Session-Ende). Ein harter Absturz kann die letzten Sekunden verlieren (dafür gibt es die Backups alle 10 min).
+
+### 14.1 Bekannte offene Logikfehler (Review-Liste, werden in Phase 2 einzeln abgearbeitet)
+
+| # | Prio | Problem | Ort |
+|---|---|---|---|
+| A1 | kritisch | Download-Slot-Leak: Bei `download-started`-Timeout wird trotzdem `activeDownloadsRef++` + `processedIdsRef.add()` ausgeführt, ohne dass je ein `download-complete` folgt → nach 5 Timeouts hängt die Schleife dauerhaft | App.tsx `initiateDownloadAsync` |
+| A2 | kritisch | Endlosschleife im `catch` der Backup-Schleife: fehlendes `break`, wenn `navigateAndVerifyChange` nach einer Exception scheitert (normaler Pfad bricht ab) | App.tsx `runBackupSession` |
+| A3 | mittel | Trust-Detektor: `matchesOwn` prüft nur `entry.originalDate`, nicht `entry.timestamp` → Minuten-Bursts ohne EXIF-Datum werden dauerhaft `trusted=false` (Metadaten/Korrekturen übersprungen) | App.tsx `evaluateScrapeTrust` |
+| A4 | mittel | Namenskollisions-Race: `(n)`-Prüfung via `existsSync` vor physischer Dateierstellung; parallele Gleichnamige können denselben Zielpfad erhalten → Overwrite | main.cjs `will-download` |
+| A5 | klein | `deleteFile`-Rückgabewert in Korrektur-Pfaden wird ignoriert; bei fehlgeschlagenem physischem Löschen werden trotzdem `hash`/`integrityStatus` entfernt | App.tsx `handleRemoveCorruptFile`/`executeDeleteAllCorrupt` |
+| A6 | klein | `dbFilePath` wird in die DB-JSON persistiert (absoluter Altpfad) | App.tsx `saveDatabase` |
+| A7 | klein | Legacy-Zähler prüft `files['scannedRanges']` (existiert nie – Root-Feld), Root-Legacy wird nie gezählt | ActionModals.tsx `runStructureCheck` |
+| A8 | klein | `checkIntegrity`-Typ deklariert `(basePath, files)`, Aufruf mit `onlySubset` via `@ts-ignore` | types.ts / App.tsx |
+| A9 | klein | „Neuen Ordner wählen“ bei existierender DB warnt nur per Log; startet man, werden alle Dateien neu geladen (Kollisions-Kopien) | App.tsx `handleInitNewDatabase` |
+| A10 | klein | `handleShowFileInExplorer` → `onShowInFolder`-Prop ist tote Kette (CorrectionModal nutzt sie nie) | App.tsx / ActionModals.tsx |
 
 ---
 

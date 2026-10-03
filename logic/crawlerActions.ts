@@ -11,12 +11,6 @@
  * Dies trennt die "Browser-Steuerung" von der React-App-Logik.
  */
 
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
-
-export const determineAlbumName = async (webview: any): Promise<string | null> => {
-    return null;
-};
-
 export const extractIdFromUrl = async (webview: any): Promise<string> => {
     const script = `(function() {
         const match = window.location.href.match(/photo\\/([^?#]+)/);
@@ -97,7 +91,7 @@ export const killVideoPlayers = async (webview: any): Promise<void> => {
     try { await webview.executeJavaScript(script); } catch(e) {}
 };
 
-export const extractCurrentImageInfo = async (webview: any): Promise<{id: string, dateStr: string, foundInSidePanel: boolean, potentialFilename?: string, panelSignature?: string}> => {
+export const extractCurrentImageInfo = async (webview: any): Promise<{id: string, dateStr: string, potentialFilename?: string}> => {
     const script = `
       (async () => {
           const browserUrl = window.location.href;
@@ -143,16 +137,11 @@ export const extractCurrentImageInfo = async (webview: any): Promise<{id: string
           }
           const uniqueTexts = [...new Set(collectedText)];
           const dateStr = uniqueTexts.join('\\n');
-          const foundInSidePanel = uniqueTexts.length > 5;
-          // Fingerprint des Panels zur Stale-Erkennung (kostet keine Extra-Zeit)
-          const panelSignature = uniqueTexts.join('|').substring(0, 512) + '::' + uniqueTexts.length + '::' + (potentialFilename || '');
           
           return {
               id: id,
               dateStr: dateStr,
-              foundInSidePanel: foundInSidePanel,
-              potentialFilename: potentialFilename,
-              panelSignature: panelSignature
+              potentialFilename: potentialFilename
           };
       })();
     `;

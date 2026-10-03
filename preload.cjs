@@ -12,7 +12,6 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('electron', {
   selectDirectory: () => ipcRenderer.invoke('select-directory'),
   selectDatabaseFile: () => ipcRenderer.invoke('select-database-file'),
-  createDirectory: (path) => ipcRenderer.invoke('create-directory', path),
   clearSessionCache: () => ipcRenderer.invoke('clear-session-cache'),
   // Update: Nimmt jetzt auch 'type' entgegen
   logToConsole: (msg, type) => ipcRenderer.send('log-to-console', msg, type),
@@ -53,8 +52,5 @@ contextBridge.exposeInMainWorld('electron', {
   computeFileHash: (config) => ipcRenderer.invoke('compute-file-hash', config),
   showItemInFolder: (fullPath) => ipcRenderer.invoke('show-item-in-folder', fullPath),
   
-  moveAndUpdateFile: (config) => ipcRenderer.invoke('move-and-update-file', config),
-  
-  // API Proxy
-  googleApiRequest: (url, options) => ipcRenderer.invoke('google-api-request', url, options)
+  moveAndUpdateFile: (config) => ipcRenderer.invoke('move-and-update-file', config)
 });

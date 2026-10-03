@@ -1,7 +1,7 @@
 
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { ProcessingLog, DownloadedFile, DownloadResult, FileDatabase, ScannedRange, DatabaseEntry, IntegrityResult, DownloadProgress, IntegrityError, RenamableFile } from './types';
+import { ProcessingLog, DownloadedFile, DownloadResult, FileDatabase, DatabaseEntry, IntegrityResult, DownloadProgress, RenamableFile } from './types';
 import { parseGoogleDateString, parseExifDateToDate, getIsoDateString } from './utils/exifUtils';
 import * as Crawler from './logic/crawlerActions';
 import * as DbUtils from './logic/databaseUtils';
@@ -134,7 +134,7 @@ const App: React.FC = () => {
               Crawler.extractCurrentImageInfo(webviewRef.current),
               timeoutPromise
           ]);
-          return result as {id: string, dateStr: string, foundInSidePanel: boolean, potentialFilename?: string};
+          return result as {id: string, dateStr: string, potentialFilename?: string};
       } catch (e: any) {
           // NEU: Fehler beim Reset ignorieren
           if (e.message && e.message.includes('GUEST_VIEW_MANAGER_CALL')) return null;
@@ -1159,8 +1159,6 @@ const App: React.FC = () => {
                 // Im Album-Modus immer herunterladen, keine DB-Prüfung
                 needsDownload = true;
             } else {
-                let dbDirty = false;
-
                 if (processedIdsRef.current.has(result.id)) {
                     const existingEntry = dbRef.current.files[result.id];
                     if (existingEntry) {
@@ -1181,7 +1179,6 @@ const App: React.FC = () => {
                             if (existingEntry.missingSince) {
                                  delete existingEntry.missingSince; 
                                  metaUpdated = true;
-                                 dbDirty = true;
                                  addLog(`✅ Status korrigiert: ${existingEntry.filename} wiedergefunden.`, 'success');
                             }
 
@@ -1195,7 +1192,6 @@ const App: React.FC = () => {
                                      const oldNameLog = existingEntry.originalName || "(keiner)";
                                      existingEntry.originalName = candidateName;
                                      metaUpdated = true;
-                                     dbDirty = true;
                                      addLog(`📝 Metadaten: Original-Name aktualisiert (${oldNameLog} -> ${candidateName})`, 'info');
                                  }
                             }
@@ -1208,10 +1204,9 @@ const App: React.FC = () => {
                                     addLog(`⚠️ Datums-Korrektur übersprungen (${trustInfo.reason}): ${existingEntry.filename} ${oldDateStr} -> ${newDateStr}`, 'warning');
                                 } else if (!existingEntry.hash) {
                                     const hashRes = await window.electron.computeFileHash({ basePath: exportPath, filename: existingEntry.filename, timestamp: existingEntry.timestamp });
-                                    if (hashRes.success && hashRes.hash) {
-                                        existingEntry.hash = hashRes.hash;
-                                        dbDirty = true;
-                                        addLog(`🔐 Hash nachgetragen – Datums-Korrektur folgt beim nächsten Lauf: ${existingEntry.filename} ${oldDateStr} -> ${newDateStr}`, 'warning');
+                                     if (hashRes.success && hashRes.hash) {
+                                         existingEntry.hash = hashRes.hash;
+                                         addLog(`🔐 Hash nachgetragen – Datums-Korrektur folgt beim nächsten Lauf: ${existingEntry.filename} ${oldDateStr} -> ${newDateStr}`, 'warning');
                                     } else {
                                         addLog(`⚠️ Datums-Korrektur übersprungen (Hash nicht lesbar): ${existingEntry.filename}`, 'warning');
                                     }
@@ -1226,17 +1221,15 @@ const App: React.FC = () => {
                                     });
 
                                     if (moveResult.success) {
-                                        existingEntry.timestamp = webTimestamp;
-                                        if (moveResult.newFilename) existingEntry.filename = moveResult.newFilename;
-                                        if (moveResult.newHash) existingEntry.hash = moveResult.newHash;
-                                        metaUpdated = true;
-                                        dbDirty = true;
-                                        addLog(`✅ Verschoben: ${oldDateStr} -> ${newDateStr}. Pfad angepasst.`, 'success');
-                                    } else if (moveResult.error === 'HASH_MISMATCH') {
-                                        if (moveResult.actualHash) {
-                                            existingEntry.hash = moveResult.actualHash;
-                                            dbDirty = true;
-                                            addLog(`🔐 Hash aktualisiert (Datei wurde früher umgeschrieben) – Korrektur folgt beim nächsten Lauf: ${existingEntry.filename}`, 'warning');
+                                         existingEntry.timestamp = webTimestamp;
+                                         if (moveResult.newFilename) existingEntry.filename = moveResult.newFilename;
+                                         if (moveResult.newHash) existingEntry.hash = moveResult.newHash;
+                                         metaUpdated = true;
+                                         addLog(`✅ Verschoben: ${oldDateStr} -> ${newDateStr}. Pfad angepasst.`, 'success');
+                                     } else if (moveResult.error === 'HASH_MISMATCH') {
+                                         if (moveResult.actualHash) {
+                                             existingEntry.hash = moveResult.actualHash;
+                                             addLog(`🔐 Hash aktualisiert (Datei wurde früher umgeschrieben) – Korrektur folgt beim nächsten Lauf: ${existingEntry.filename}`, 'warning');
                                         } else {
                                             addLog(`❌ Hash-Mismatch – Korrektur abgebrochen: ${existingEntry.filename}`, 'error');
                                         }

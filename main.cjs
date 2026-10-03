@@ -18,7 +18,7 @@
 
 
 
-const { app, BrowserWindow, ipcMain, dialog, session, fs: fsOriginal, shell, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, Menu } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const fsPromises = require('fs').promises; // NEU: Async FS
@@ -411,11 +411,6 @@ ipcMain.handle('select-directory', async () => {
 ipcMain.handle('select-database-file', async () => {
   const result = await dialog.showOpenDialog(mainWindow, { properties: ['openFile'], filters: [{ name: 'JSON Database', extensions: ['json'] }] });
   return result.canceled ? null : result.filePaths[0];
-});
-
-ipcMain.handle('create-directory', async (event, dirPath) => {
-  if (!fs.existsSync(dirPath)) fs.mkdirSync(dirPath, { recursive: true });
-  return true;
 });
 
 ipcMain.handle('load-database', async (event, filePath) => {

@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useMemo } from 'react';
-import { DatabaseEntry, IntegrityError, IntegrityResult, RenamableFile } from '../types';
+import { DatabaseEntry, IntegrityResult, RenamableFile } from '../types';
 
 interface CorrectionModalProps {
     orphans: { id: string, entry: DatabaseEntry }[];

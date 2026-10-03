@@ -1,5 +1,0 @@
-{
-  "name": "RLE Google Fotos Backup",
-  "description": "Lädt Google Fotos herunter und korrigiert EXIF-Daten.",
-  "requestFramePermissions": []
-}

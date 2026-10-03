@@ -1,5 +1,5 @@
 
-import { DatabaseEntry, IntegrityError } from '../types';
+import { DatabaseEntry } from '../types';
 
 /**
  * Generiert CSV und speichert sie im gleichen Verzeichnis wie die DB.
@@ -63,30 +63,6 @@ export const exportDatabaseToCsv = async (files: Record<string, DatabaseEntry>, 
     } else {
         throw new Error(result.error || "Fehler beim Speichern der CSV");
     }
-};
-
-/**
- * Löscht Orphans (vermisste Dateien) physisch und aus der DB.
- */
-export const deleteOrphansFromDisk = async (
-    orphans: {id: string, entry: DatabaseEntry}[], 
-    basePath: string,
-    onProgress: (msg: string) => void
-): Promise<string[]> => {
-    if (!window.electron) throw new Error("Electron Context missing");
-    
-    const deletedIds: string[] = [];
-    
-    for (const orphan of orphans) {
-        await window.electron.deleteFile({
-            basePath: basePath,
-            filename: orphan.entry.filename,
-            timestamp: orphan.entry.timestamp
-        });
-        deletedIds.push(orphan.id);
-    }
-    
-    return deletedIds;
 };
 
 /**

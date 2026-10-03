@@ -3,24 +3,6 @@
 
 
 
-import piexif from 'piexifjs';
-
-/**
- * Konvertiert ein Date-Objekt in das EXIF Format "YYYY:MM:DD HH:MM:SS"
- */
-export const formatDateForExif = (date: Date): string => {
-  const pad = (n: number) => (n < 10 ? '0' + n : n);
-  
-  const year = date.getFullYear();
-  const month = pad(date.getMonth() + 1);
-  const day = pad(date.getDate());
-  const hours = pad(date.getHours());
-  const minutes = pad(date.getMinutes());
-  const seconds = pad(date.getSeconds());
-
-  return `${year}:${month}:${day} ${hours}:${minutes}:${seconds}`;
-};
-
 /**
  * Erzeugt einen ISO-ähnlichen String "YYYY-MM-DD" basierend auf der LOKALEN Zeit des Date-Objekts.
  * Dies ist wichtig für die Gruppierung nach Tagen, da Google Photos visuelle Daten (Lokalzeit) nutzt.
@@ -192,16 +174,3 @@ export const parseGoogleDateString = (textBlock: string): Date => {
     return new Date("Invalid"); 
 };
 
-export const blobToDataURL = (blob: Blob): Promise<string> => {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result as string);
-    reader.onerror = reject;
-    reader.readAsDataURL(blob);
-  });
-};
-
-export const dataURLtoBlob = async (dataurl: string): Promise<Blob> => {
-    const res = await fetch(dataurl);
-    return await res.blob();
-}

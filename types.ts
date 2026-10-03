@@ -1,32 +1,5 @@
 
 
-export interface GooglePhotoAlbum {
-  id: string;
-  title: string;
-  mediaItemsCount: string;
-  coverPhotoBaseUrl: string;
-  productUrl: string;
-}
-
-export interface GoogleMediaItem {
-  id: string;
-  filename: string;
-  baseUrl: string;
-  mimeType: string;
-  mediaMetadata: {
-    creationTime: string;
-    width: string;
-    height: string;
-    photo?: {
-      cameraMake?: string;
-      cameraModel?: string;
-      focalLength?: number;
-      apertureFNumber?: number;
-      isoEquivalent?: number;
-    };
-  };
-}
-
 export interface ProcessingLog {
   timestamp: number;
   message: string;
@@ -45,16 +18,6 @@ export interface DownloadedFile {
     type: 'image' | 'video';
     status: string;
     path: string;
-}
-
-export interface AppState {
-  accessToken: string | null;
-  albums: GooglePhotoAlbum[];
-  selectedAlbums: Set<string>;
-  isProcessing: boolean;
-  progress: number;
-  totalItemsToProcess: number;
-  logs: ProcessingLog[];
 }
 
 export interface DownloadConfig {
@@ -163,7 +126,6 @@ declare global {
     electron: {
       selectDirectory: () => Promise<string | null>;
       selectDatabaseFile: () => Promise<string | null>; // Neu: Wählt explizit Datei
-      createDirectory: (path: string) => Promise<boolean>;
       clearSessionCache: () => Promise<void>;
       logToConsole: (msg: string, type?: string) => void;
       openLogsFolder: () => Promise<string>;
@@ -199,9 +161,6 @@ declare global {
       }) => Promise<{ success: boolean, newFilename?: string, newHash?: string, actualHash?: string, error?: string }>;
 
       showItemInFolder: (fullPath: string) => Promise<void>;
-
-      // API Proxy
-      googleApiRequest: (url: string, options: any) => Promise<any>;
     };
   }
 }
