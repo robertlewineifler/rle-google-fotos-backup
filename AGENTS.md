@@ -115,7 +115,7 @@ dist/, release/              Build-Artefakte (via .gitignore ausgeschlossen)
         * `originalName` aus Panel-Filename aktualisieren (nur wenn „trusted“, siehe Abschnitt 9).
         * Weicht `entry.timestamp` um > 60 s vom Web-Datum ab → Datei verschieben/umschreiben via `moveAndUpdateFile` – **nur mit Hash-Gate** (siehe 6.3). Ohne gespeicherten Hash wird dieser erst nachgetragen und die Korrektur auf den nächsten Lauf verschoben.
         * `scannedAt = Date.now()`.
-   f. **Download anstoßen** (`initiateDownloadAsync`): `prepareDownload(config)` → `triggerDownloadKeys(webview)` (simuliert **Shift+D**) → blockierend warten auf `download-started` (max. **45 s**, F10). Nur bei echtem Start: `activeDownloads` erhöhen + ID zu `processedIdsRef` hinzufügen. Bei Timeout (F3/F10): Warnlog, Eintrag in `db.skippedDownloads[id]` (persistiert), `cancelPendingDownload` entwertet die Config, **kein** Slot/`processedIds`; die Navigation läuft erst nach Start oder Timeout weiter. Ein später eintreffender Download wird vom Main-Prozess verworfen. Einzeldownload („⬇ 1“) übergibt `startTimeoutMs = null` → **kein Limit** (F10b).
+   f. **Download anstoßen** (`initiateDownloadAsync`): `prepareDownload(config)` → `triggerDownloadKeys(webview)` (simuliert **Shift+D**) → blockierend warten auf `download-started` (max. **45 s**, F10). Nur bei echtem Start: `activeDownloads` erhöhen + ID zu `processedIdsRef` hinzufügen. Bei Timeout (F3/F10): Warnlog, Eintrag in `db.skippedDownloads[id]` (persistiert), `cancelPendingDownload` entwertet die Config, **kein** Slot/`processedIds`; die Navigation läuft erst nach Start oder Timeout weiter. Ein später eintreffender Download wird vom Main-Prozess verworfen. Einzeldownload („⬇ 1“) übergibt `startTimeoutMs = null` → **kein Limit** (F10b). Während des Wartens zeigt das Overlay die Wartekarte (F11).
    g. **Navigation:** `navigateNext` (ArrowRight) + `killVideoPlayers`, dann bis zu 30× à 200 ms prüfen, ob die URL-ID wechselt (`navigateAndVerifyChange`). Anschließend wartet `waitForPanelRefresh` (F1, 150 ms-Poll, max. 3 s) darauf, dass das Info-Panel zum neuen Foto wechselt (F1.3-Namens-Anker gegen Ein-Schritt-Lag). Bei Nicht-Erfolg: bis zu 2 Resyncs (prev/next); bleibt es stale → Session-Abbruch (F1.3). Kein ID-Wechsel nach 6 s → Loop bricht ab (vermutlich Bibliotheksende).
 5. Nach dem Loop: auf alle aktiven Downloads warten.
 6. `finishBackupSession()` (nur Haupt-Backup): `checkForOrphans()` + DB speichern + Log „Backup-Vorgang beendet.“
@@ -143,6 +143,7 @@ dist/, release/              Build-Artefakte (via .gitignore ausgeschlossen)
 ### 5.1 `will-download`-Handler
 - Reagiert nur, wenn `nextDownloadConfig.active === true` (Werte kommen via `prepare-download`). Ungeplante/verspätete Downloads werden **verworfen** (`event.preventDefault()`, F10; kein Speichern-Dialog, kein Tracking) und geloggt (`Ungeplanter Download verworfen`).
 - `nextDownloadConfig` ist ein **globaler Singleton**; deshalb wartet das Frontend, bevor die nächste ID vorbereitet wird: in der Schleife blockierend auf Start/Timeout, vor Einzeldownloads/Session-Start per `discardPendingStarts`. `cancel-pending-download` entwertet die Config bei Timeout/Reset/Logout.
+- `download-started` (F11) wird **nach** der Dateinamen-Sanitizing-Logik gesendet und enthält `id` + finalen Dateinamen (`finalFilename`), damit das Frontend die Wartekarte in-place zur Fortschrittskarte machen kann.
 - Pfadlogik:
   - Normal: `<targetDir>/<YYYY>/<MM>/`
   - Album (`flatStructure: true`): direkt `<targetDir>/` (also z. B. `…/Alben/Urlaub_2024/`)
@@ -372,7 +373,7 @@ Alle Kanalnamen exakt so (main.cjs `ipcMain`):
 | `verifyFileIntegrityBatch` | `verify-file-integrity-batch` | invoke | Deep Scan |
 | `prepareDownload` | `prepare-download` | invoke | Setzt `nextDownloadConfig` |
 | `cancelPendingDownload` | `cancel-pending-download` | invoke | Entwertet offene Download-Config (F10) |
-| `onDownloadStarted` | `download-started` | on | Slot-Freigabe |
+| `onDownloadStarted` | `download-started` | on | Slot-Freigabe + finaler Dateiname (F11) |
 | `onDownloadComplete` | `download-complete` | on | Ergebnis |
 | `onDownloadProgress` | `download-progress` | on | Fortschritt |
 | `removeDownloadListener` | – | – | entfernt alle 3 Listener |
@@ -392,7 +393,7 @@ Alle Kanalnamen exakt so (main.cjs `ipcMain`):
 
 - **StartupScreen** solange `!isInitialized`.
 - **Webview-Bereich** oben (`https://photos.google.com`, `allowpopups`). Overlays:
-  - Download-Fortschrittsbalken (links oben, bis 5 gleichzeitig).
+  - Download-Fortschrittsbalken (links oben, bis 5 gleichzeitig). **F11:** Während des Wartens auf `download-started` zeigt dieselbe Karte (stabiler Key `job:<id>`) „Warte auf Download…“, einen Sekunden-Timer und klein „max. 45 s“ (bzw. „ohne Limit“ beim Einzeldownload); beim Start wechselt sie in-place zum Fortschritt (kein Positionssprung, konstante Kartenhöhe durch reservierte Fußzeile). **F12:** feste Slots 1–5 (`slot` am Progress-Eintrag, oberster freier Slot); fertige Downloads hinterlassen unsichtbare Lücken, Karten rutschen nicht nach.
   - „Turbo Backup“-Panel (rechts oben): `processedCount`, aktive Downloads x/5, Batch x/1000.
 - **Untere Leiste (h-64):**
   - Links: Status, Scan-Historie-Button, Duplikat-Warnung, „Datenbank prüfen“, „Dateinamen bereinigen“, „Korrekturen“ (rot, wenn Orphans/Corrupt/Übersprungene), CSV-Export, Reset, Logout, Start/Stop, „⬇ 1“.

@@ -48,6 +48,11 @@ export interface DownloadProgress {
     percent: number; // 0.0 bis 1.0
     received: number; // bytes
     total: number; // bytes
+    // F11: Warteanzeige (bis download-started eintrifft)
+    waiting?: boolean;
+    waitStartedAt?: number;
+    waitTimeoutMs?: number | null; // 45000 im Backup, null = Einzeldownload ohne Limit
+    slot?: number; // F12: fester UI-Slot 1-5 (kein Nachrutschen)
 }
 
 // --- DATABASE TYPES ---
@@ -152,7 +157,7 @@ declare global {
       // Download
       prepareDownload: (config: DownloadConfig) => Promise<boolean>;
       cancelPendingDownload: () => Promise<boolean>; // F10: entwertet die offene Download-Config
-      onDownloadStarted: (callback: (id: string) => void) => void; // NEU
+      onDownloadStarted: (callback: (id: string, filename: string) => void) => void; // F11: finaler Dateiname
       onDownloadComplete: (callback: (result: DownloadResult) => void) => void;
       onDownloadProgress: (callback: (progress: DownloadProgress) => void) => void;
       removeDownloadListener: () => void;

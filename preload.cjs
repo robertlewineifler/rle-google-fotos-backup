@@ -29,7 +29,8 @@ contextBridge.exposeInMainWorld('electron', {
   prepareDownload: (config) => ipcRenderer.invoke('prepare-download', config),
   cancelPendingDownload: () => ipcRenderer.invoke('cancel-pending-download'), // F10
   onDownloadStarted: (callback) => {
-      const listener = (event, id) => callback(id);
+      // F11: finaler Dateiname wird mitgeliefert (Wartekarte -> Fortschrittskarte ohne Positionssprung)
+      const listener = (event, id, filename) => callback(id, filename);
       ipcRenderer.on('download-started', listener);
   },
   onDownloadComplete: (callback) => {

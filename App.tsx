@@ -31,8 +31,9 @@ const App: React.FC = () => {
   // Neuer State für den Batch-Fortschritt
   const [batchCount, setBatchCount] = useState(0);
 
-  // State für mehrere parallele Downloads (Filename -> Progress)
+  // State für mehrere parallele Downloads (Job-Key/Filename -> Progress)
   const [activeProgress, setActiveProgress] = useState<Record<string, DownloadProgress>>({});
+  const [nowTs, setNowTs] = useState(Date.now()); // F11: 1-s-Ticker für die Warteanzeige
   const [activeDownloadsCount, setActiveDownloadsCount] = useState(0);
 
   // --- Database & Tracking State (Refs) ---
@@ -46,6 +47,8 @@ const App: React.FC = () => {
   const activeDownloadsRef = useRef(0);
   // F10: Resolver-Signatur mit started-Flag (Stop/Reset brechen mit false ab, Timeout mit false + Warnung)
   const pendingStartResolvers = useRef<Map<string, (started: boolean) => void>>(new Map());
+  // F11: finaler Dateiname -> stabiler Job-Key (Wartekarte wird in-place zur Fortschrittskarte)
+  const jobKeyByFilenameRef = useRef<Map<string, string>>(new Map());
   const isResettingRef = useRef(false); // NEU: Verhindert IPC nach Reset
 
   // --- Orphans, Duplicates & Missing ---
@@ -285,12 +288,24 @@ const App: React.FC = () => {
   // --- GLOBAL ELECTRON LISTENER (PIPELINE) ---
   useEffect(() => {
       if(window.electron) {
-          window.electron.onDownloadStarted((id: string) => {
+          window.electron.onDownloadStarted((id: string, filename: string) => {
                const resolver = pendingStartResolvers.current.get(id);
                if (resolver) {
                    resolver(true); 
                    pendingStartResolvers.current.delete(id);
                }
+               // F11: Wartekarte in-place in die Fortschrittskarte überführen (gleicher Key -> kein Positionssprung)
+               const jobKey = `job:${id}`;
+               if (!filename) {
+                   // Dev-Hinweis: passiert, wenn der Main-Prozess noch die alte main.cjs geladen hat (kein Neustart nach F11).
+                   addLog('⚠️ download-started ohne Dateinamen – Main-Prozess veraltet? Bitte App neu starten.', 'warning');
+               }
+               if (filename) jobKeyByFilenameRef.current.set(filename, jobKey);
+               setActiveProgress(prev => {
+                   const entry = prev[jobKey];
+                   if (!entry) return prev;
+                   return { ...prev, [jobKey]: { ...entry, filename: filename || entry.filename, waiting: false, percent: 0, received: 0, total: 0 } };
+               });
           });
 
           window.electron.onDownloadComplete(async (result: DownloadResult) => {
@@ -302,7 +317,10 @@ const App: React.FC = () => {
               setActiveProgress(prev => {
                   const next = { ...prev };
                   const keyToRemove = result.progressFilename || result.filename;
-                  delete next[keyToRemove];
+                  const mappedKey = jobKeyByFilenameRef.current.get(keyToRemove);
+                  if (mappedKey) jobKeyByFilenameRef.current.delete(keyToRemove);
+                  delete next[mappedKey || keyToRemove];
+                  delete next[`job:${result.id}`]; // F11: defensiv
                   return next;
               });
 
@@ -376,10 +394,14 @@ const App: React.FC = () => {
 
           window.electron.onDownloadProgress((progress: DownloadProgress) => {
              if (isResettingRef.current) return;
-             setActiveProgress(prev => ({
-                 ...prev,
-                 [progress.filename]: progress
-             }));
+             // F11: über das Dateiname-Mapping denselben Job-Key weiterverwenden (Karte bleibt bestehen)
+             const jobKey = jobKeyByFilenameRef.current.get(progress.filename) || progress.filename;
+             setActiveProgress(prev => {
+                 const existing = prev[jobKey];
+                 // F12: vorhandenen Slot behalten; im Fallback (kein Mapping) neuen Slot vergeben
+                 const slot = existing ? existing.slot : assignProgressSlot(prev);
+                 return { ...prev, [jobKey]: { ...progress, slot } };
+             });
           });
       }
       return () => {
@@ -408,6 +430,14 @@ const App: React.FC = () => {
   };
 
   useEffect(() => { if (isInitialized) { updateOrphansList(); updateSkippedList(); } }, [isInitialized]);
+
+  // F11: Sekunden-Ticker nur, solange eine Wartekarte sichtbar ist.
+  const hasWaitingProgress = Object.values(activeProgress).some(p => p.waiting);
+  useEffect(() => {
+      if (!hasWaitingProgress) return;
+      const timer = setInterval(() => setNowTs(Date.now()), 1000);
+      return () => clearInterval(timer);
+  }, [hasWaitingProgress]);
 
   // --- INITIALIZATION HANDLERS ---
   const handleInitLoadDatabase = async () => {
@@ -920,6 +950,7 @@ const App: React.FC = () => {
       activeDownloadsRef.current = 0;
       setActiveDownloadsCount(0);
       setActiveProgress({});
+      jobKeyByFilenameRef.current.clear(); // F11
       cancelPendingStarts(); // F10: offene Starts sofort auflösen (Reset)
       isAlbumModeRef.current = false;
       albumTargetPathRef.current = null;
@@ -994,6 +1025,13 @@ const App: React.FC = () => {
       return true;
   };
 
+  // F12: Obersten freien Slot (1-5) für eine Download-Karte ermitteln.
+  // Fertige Downloads geben ihren Slot frei -> Karten rutschen nicht nach, Lücken bleiben.
+  const assignProgressSlot = (prev: Record<string, DownloadProgress>): number | undefined => {
+      const used = new Set(Object.values(prev).map(p => p.slot).filter((s): s is number => typeof s === 'number'));
+      return [1, 2, 3, 4, 5].find(s => !used.has(s));
+  };
+
   // --- CORE CRAWLER LOGIC ---
   // F10: startTimeoutMs === null (Einzeldownload) -> kein Limit, wartet bis zum Start.
   const initiateDownloadAsync = async (info: any, savePath: string, isAlbumDownload: boolean = false, trusted: boolean = true, startTimeoutMs: number | null = DOWNLOAD_START_TIMEOUT_MS): Promise<boolean> => {
@@ -1007,6 +1045,21 @@ const App: React.FC = () => {
           flatStructure: isAlbumDownload,
           trusted
       });
+
+      // F11: Wartekarte sofort anzeigen (stabiler Job-Key; wird beim Start in-place zur Fortschrittskarte).
+      // F12: fester Slot (oberster freier), damit nichts nachrutscht.
+      const waitKey = `job:${info.id}`;
+      setActiveProgress(prev => ({
+          ...prev,
+          [waitKey]: {
+              filename: info.potentialFilename || info.id,
+              percent: 0, received: 0, total: 0,
+              waiting: true,
+              waitStartedAt: Date.now(),
+              waitTimeoutMs: startTimeoutMs,
+              slot: assignProgressSlot(prev)
+          }
+      }));
 
       // F3 (A1) + F10: Resolver meldet, OB der Download gestartet ist (verhindert Slot-Leak bei Timeout).
       const startPromise = new Promise<boolean>((resolve) => {
@@ -1028,6 +1081,13 @@ const App: React.FC = () => {
       const started = await startPromise;
 
       if (!started) {
+          // F11: Wartekarte entfernen (Timeout bzw. Stop/Reset-Cancel)
+          setActiveProgress(prev => {
+              if (!(waitKey in prev)) return prev;
+              const next = { ...prev };
+              delete next[waitKey];
+              return next;
+          });
           // F10: Config entwerten, damit ein später eintreffender Start sie nicht mehr erben kann.
           await window.electron.cancelPendingDownload();
           return false; // keinen Slot belegen, ID nicht als verarbeitet markieren
@@ -1679,6 +1739,36 @@ const App: React.FC = () => {
   const skippedCount = Object.keys(skippedPhotos).length; // F10
   const hasCorrections = orphans.length > 0 || corruptFilesCount > 0 || skippedCount > 0;
 
+  // F12: Download-Karten festen Slots zuordnen (Lücken bleiben stehen, nichts rutscht nach)
+  const progressBySlot = new Map<number, [string, DownloadProgress]>();
+  const unslottedProgress: [string, DownloadProgress][] = [];
+  (Object.entries(activeProgress) as [string, DownloadProgress][]).forEach(([key, p]) => {
+      if (typeof p.slot === 'number' && p.slot >= 1 && p.slot <= 5) progressBySlot.set(p.slot, [key, p]);
+      else unslottedProgress.push([key, p]);
+  });
+
+  const renderProgressCard = (key: string, progress: DownloadProgress) => {
+      const isWaiting = !!progress.waiting;
+      const elapsed = isWaiting ? Math.max(0, Math.floor((nowTs - (progress.waitStartedAt || nowTs)) / 1000)) : 0;
+      const waitLabel = progress.waitTimeoutMs === null ? 'ohne Limit' : `max. ${Math.round(DOWNLOAD_START_TIMEOUT_MS / 1000)} s`;
+      return (
+       <div key={key} className={`bg-blue-900/90 text-white p-2 rounded-lg shadow-xl border backdrop-blur-sm ${isWaiting ? 'border-sky-400' : 'border-blue-500'}`}>
+          <div className="flex justify-between text-[10px] mb-1 font-mono">
+              <span className="truncate max-w-[150px]">{progress.filename}</span>
+              <span>{isWaiting ? `${elapsed} s` : (progress.total > 0 ? Math.round(progress.percent * 100) + '%' : '...')}</span>
+          </div>
+          <div className="h-1.5 bg-blue-950 rounded-full overflow-hidden">
+              <div className={`h-full bg-blue-400 transition-all duration-200 ${progress.total === 0 ? 'animate-pulse w-full opacity-50' : ''}`} style={{width: progress.total > 0 ? `${progress.percent * 100}%` : '100%'}}></div>
+          </div>
+          {/* F11: reservierte Fußzeile -> konstante Kartenhöhe, Übergang verschiebt nichts */}
+          <div className={`h-3 mt-0.5 text-[9px] leading-3 flex justify-between ${isWaiting ? 'text-sky-200/90' : 'text-transparent'}`}>
+              <span>{isWaiting ? 'Warte auf Download…' : '\u00A0'}</span>
+              <span>{isWaiting ? waitLabel : '\u00A0'}</span>
+          </div>
+      </div>
+      );
+  };
+
   return (
     <div className="flex flex-col h-screen bg-slate-900 text-slate-100 overflow-hidden relative">
       {/* LOADING OVERLAY */}
@@ -1745,19 +1835,23 @@ const App: React.FC = () => {
         // @ts-ignore
         allowpopups="true" />
         
-        {/* DOWNLOAD STATUS OVERLAY */}
+        {/* DOWNLOAD STATUS OVERLAY (F12: feste Slots 1-5, fertige Downloads hinterlassen Lücken) */}
         <div className="absolute top-4 left-4 z-50 flex flex-col gap-2 w-80 pointer-events-none">
-            {(Object.values(activeProgress) as DownloadProgress[]).map((progress, idx) => (
-                 <div key={idx} className="bg-blue-900/90 text-white p-2 rounded-lg shadow-xl border border-blue-500 backdrop-blur-sm">
-                    <div className="flex justify-between text-[10px] mb-1 font-mono">
-                        <span className="truncate max-w-[150px]">{progress.filename}</span>
-                        <span>{progress.total > 0 ? Math.round(progress.percent * 100) + '%' : '...'}</span>
-                    </div>
-                    <div className="h-1.5 bg-blue-950 rounded-full overflow-hidden">
-                        <div className={`h-full bg-blue-400 transition-all duration-200 ${progress.total === 0 ? 'animate-pulse w-full opacity-50' : ''}`} style={{width: progress.total > 0 ? `${progress.percent * 100}%` : '100%'}}></div>
-                    </div>
-                </div>
-            ))}
+            {[1, 2, 3, 4, 5].map(slot => {
+                const found = progressBySlot.get(slot);
+                if (!found) {
+                    // Unsichtbarer Platzhalter (gleicher Aufbau) -> freier Slot bleibt als Lücke stehen
+                    return (
+                        <div key={`slot-${slot}`} className="invisible w-full bg-blue-900/90 p-2 rounded-lg shadow-xl border border-blue-500">
+                            <div className="flex justify-between text-[10px] mb-1 font-mono"><span>{'\u00A0'}</span><span>{'\u00A0'}</span></div>
+                            <div className="h-1.5 bg-blue-950 rounded-full overflow-hidden"><div className="h-full w-full"></div></div>
+                            <div className="h-3 mt-0.5 text-[9px] leading-3 flex justify-between"><span>{'\u00A0'}</span><span>{'\u00A0'}</span></div>
+                        </div>
+                    );
+                }
+                return renderProgressCard(found[0], found[1]);
+            })}
+            {unslottedProgress.map(([key, progress]) => renderProgressCard(key, progress))}
         </div>
 
         {isWalking && (

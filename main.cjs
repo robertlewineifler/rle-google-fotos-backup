@@ -148,9 +148,6 @@ function createWindow() {
     // Global sofort resetten, damit der nächste Loop nicht blockiert oder überschreibt
     nextDownloadConfig.active = false; 
 
-    // SIGNAL AN FRONTEND: "Habe Download übernommen, du kannst weitermachen"
-    mainWindow.webContents.send('download-started', config.id);
-
     const originalNameRaw = item.getFilename();
     const webDate = new Date(config.dateTimestamp);
     
@@ -207,6 +204,10 @@ function createWindow() {
     let savePath = path.join(targetSubFolder, finalFilename);
     reserveTargetPath(savePath);
     item.setSavePath(savePath);
+
+    // SIGNAL AN FRONTEND: "Habe Download übernommen, du kannst weitermachen"
+    // F11: finalen Dateinamen mitgeben -> Wartekarte geht in-place in die Fortschrittskarte über.
+    mainWindow.webContents.send('download-started', config.id, finalFilename);
 
     appendLog('info', `Download Start: id=${config.id} file=${finalFilename} dir=${targetSubFolder} webDate=${webDate.toLocaleString()} trusted=${trusted}`);
 
