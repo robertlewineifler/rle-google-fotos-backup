@@ -75,6 +75,15 @@ export interface DatabaseEntry {
     integrityCheckedAt?: number; // NEU: Wann geprüft
 }
 
+// F10: Fotos, deren Download-Start nach dem Timeout nie bestätigt wurde (Google-ID als Key).
+export interface SkippedDownload {
+    id: string;                 // Google Photo ID (aus /photo/<id>)
+    webTimestamp: number;       // Web-Datum aus dem Panel; 0 = unbekannt
+    filename?: string;          // Dateiname aus dem Panel, falls ermittelbar
+    detectedAt: number;         // Zeitpunkt des Timeouts
+    mode: 'backup' | 'album';
+}
+
 export interface FileDatabase {
     basePath: string; // Pfad zum Ordner, in dem die DB liegt (und die Fotos)
     dbFilePath?: string; // Voller Pfad zur JSON Datei
@@ -82,6 +91,7 @@ export interface FileDatabase {
     files: Record<string, DatabaseEntry>; // Key = Google Photo ID
     
     scannedDays?: Record<string, number>; // NEU: 'YYYY-MM-DD' -> Timestamp des letzten Scans
+    skippedDownloads?: Record<string, SkippedDownload>; // F10: Key = Google Photo ID
     scannedRanges?: ScannedRange[]; // VERALTET (Legacy support)
     hashScheme?: number; // NEU: 2 = sourceHash/hash getrennt (Migration abgeschlossen)
 }
@@ -141,6 +151,7 @@ declare global {
 
       // Download
       prepareDownload: (config: DownloadConfig) => Promise<boolean>;
+      cancelPendingDownload: () => Promise<boolean>; // F10: entwertet die offene Download-Config
       onDownloadStarted: (callback: (id: string) => void) => void; // NEU
       onDownloadComplete: (callback: (result: DownloadResult) => void) => void;
       onDownloadProgress: (callback: (progress: DownloadProgress) => void) => void;

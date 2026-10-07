@@ -1,7 +1,7 @@
 
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { ProcessingLog, DownloadedFile, DownloadResult, FileDatabase, DatabaseEntry, IntegrityResult, DownloadProgress, RenamableFile } from './types';
+import { ProcessingLog, DownloadedFile, DownloadResult, FileDatabase, DatabaseEntry, IntegrityResult, DownloadProgress, RenamableFile, SkippedDownload } from './types';
 import { parseGoogleDateString, parseExifDateToDate, getIsoDateString } from './utils/exifUtils';
 import * as Crawler from './logic/crawlerActions';
 import * as DbUtils from './logic/databaseUtils';
@@ -9,12 +9,18 @@ import { StartupScreen } from './components/StartupScreen';
 import { IntegrityReportModal, CorrectionModal, RenameModal, AlbumDownloadModal } from './components/ActionModals';
 import { ScanHeatmapModal } from './components/ScanHeatmap';
 
+// F10: Google braucht bei großen Videos teils >30 s bis will-download feuert.
+// Danach wird die Config entwertet und das Foto in skippedDownloads geführt.
+const DOWNLOAD_START_TIMEOUT_MS = 45000;
+
 const App: React.FC = () => {
   // --- UI State ---
   const [isInitialized, setIsInitialized] = useState(false);
   const [logs, setLogs] = useState<ProcessingLog[]>([]); 
   const [exportPath, setExportPath] = useState<string | null>(null);
   const [dbFilePath, setDbFilePath] = useState<string | null>(null);
+  // F10: Spiegel des DB-Pfads, damit saveDatabase auch aus Callbacks des ersten Renders (onDownloadComplete) korrekt arbeitet.
+  const dbFilePathRef = useRef<string | null>(null);
   
   const [isWalking, setIsWalking] = useState(false);
   const [isChecking, setIsChecking] = useState(false); // NEU: Lade-Status für Checks
@@ -30,7 +36,7 @@ const App: React.FC = () => {
   const [activeDownloadsCount, setActiveDownloadsCount] = useState(0);
 
   // --- Database & Tracking State (Refs) ---
-  const dbRef = useRef<FileDatabase>({ basePath: '', lastUpdated: 0, files: {}, scannedDays: {} });
+  const dbRef = useRef<FileDatabase>({ basePath: '', lastUpdated: 0, files: {}, scannedDays: {}, skippedDownloads: {} });
   const processedIdsRef = useRef<Set<string>>(new Set());
   const sessionSeenIds = useRef<Set<string>>(new Set());
   const minDateEncountered = useRef<number | null>(null);
@@ -38,11 +44,13 @@ const App: React.FC = () => {
   
   // --- Asynchronous Pipeline State ---
   const activeDownloadsRef = useRef(0);
-  const pendingStartResolvers = useRef<Map<string, () => void>>(new Map());
+  // F10: Resolver-Signatur mit started-Flag (Stop/Reset brechen mit false ab, Timeout mit false + Warnung)
+  const pendingStartResolvers = useRef<Map<string, (started: boolean) => void>>(new Map());
   const isResettingRef = useRef(false); // NEU: Verhindert IPC nach Reset
 
   // --- Orphans, Duplicates & Missing ---
   const [orphans, setOrphans] = useState<{id: string, entry: DatabaseEntry}[]>([]);
+  const [skippedPhotos, setSkippedPhotos] = useState<Record<string, SkippedDownload>>({}); // F10
   const [integrityResult, setIntegrityResult] = useState<IntegrityResult | null>(null);
   const [renamableFiles, setRenamableFiles] = useState<RenamableFile[]>([]); // NEU
   
@@ -280,7 +288,7 @@ const App: React.FC = () => {
           window.electron.onDownloadStarted((id: string) => {
                const resolver = pendingStartResolvers.current.get(id);
                if (resolver) {
-                   resolver(); 
+                   resolver(true); 
                    pendingStartResolvers.current.delete(id);
                }
           });
@@ -299,6 +307,9 @@ const App: React.FC = () => {
               });
 
               if (result.success) {
+                  // F10: erfolgreich nachgeladen -> aus Übersprungen-Liste entfernen.
+                  // Persistiert wird erst am Ende des Blocks, damit der Snapshot auch den neuen files-Eintrag enthält.
+                  const wasSkipped = removeSkippedPhoto(result.id);
                   newDownloadMetaRef.current.set(result.id, { filename: result.filename, originalDate: result.originalExifDate || undefined });
                   const ext = result.filename.split('.').pop()?.toLowerCase();
                   const isVideo = ['mp4', 'mov', 'm4v', 'avi', '3gp', 'mpg'].includes(ext || '');
@@ -351,6 +362,9 @@ const App: React.FC = () => {
                       setProcessedCount(prev => prev + 1);
                       addLog(`Download fertig: ${result.filename}`, 'success');
                   }
+
+                  // F10: Jetzt enthält der DB-Snapshot sowohl die Skip-Entfernung als auch den neuen files-Eintrag.
+                  if (wasSkipped) void saveDatabase();
               } else {
                   if (isAlbumModeRef.current) {
                       addLog(`[ALBUM] Fehler beim Download (${result.id}): ${result.error}`, 'album');
@@ -381,7 +395,19 @@ const App: React.FC = () => {
       setOrphans(missingFiles);
   };
 
-  useEffect(() => { if (isInitialized) updateOrphansList(); }, [isInitialized]);
+  // F10: Übersprungene Fotos (Download-Start-Timeout) aus der DB in den UI-State spiegeln.
+  // Einträge, die inzwischen eine DB-Datei haben, werden selbstheilend entfernt.
+  const updateSkippedList = () => {
+      const skipped = dbRef.current.skippedDownloads || {};
+      let changed = false;
+      for (const id of Object.keys(skipped)) {
+          if (dbRef.current.files[id]) { delete skipped[id]; changed = true; }
+      }
+      if (changed) void saveDatabase();
+      setSkippedPhotos({ ...skipped });
+  };
+
+  useEffect(() => { if (isInitialized) { updateOrphansList(); updateSkippedList(); } }, [isInitialized]);
 
   // --- INITIALIZATION HANDLERS ---
   const handleInitLoadDatabase = async () => {
@@ -399,8 +425,9 @@ const App: React.FC = () => {
             dbRef.current = loadedDb;
             dbRef.current.dbFilePath = filePath;
             dbRef.current.basePath = basePath;
-            // Falls alte DB ohne scannedDays, initialisieren
+            // Falls alte DB ohne scannedDays/skippedDownloads, initialisieren
             if (!dbRef.current.scannedDays) dbRef.current.scannedDays = {};
+            if (!dbRef.current.skippedDownloads) dbRef.current.skippedDownloads = {}; // F10
 
             // EINMALIGE HASH-MIGRATION (Schema 2):
             // Bisheriger "hash" war der Roh-Hash VOR dem Metadaten-Rewrite -> jetzt sourceHash.
@@ -430,6 +457,7 @@ const App: React.FC = () => {
             setScannedDays(dbRef.current.scannedDays);
             setExportPath(basePath);
             setDbFilePath(filePath);
+            dbFilePathRef.current = filePath;
             updateOrphansList();
             setIsInitialized(true); 
             isResettingRef.current = false;
@@ -460,13 +488,16 @@ const App: React.FC = () => {
             lastUpdated: Date.now(),
             files: {},
             scannedDays: {}, // Initial leer
+            skippedDownloads: {}, // F10
             hashScheme: 2
         };
         processedIdsRef.current = new Set();
         setScannedDays({});
         setExportPath(basePath);
         setDbFilePath(filePath);
+        dbFilePathRef.current = filePath;
         setOrphans([]);
+        setSkippedPhotos({});
         
         let existing = null;
         try { existing = await window.electron.loadDatabase(filePath); } catch (e) { /* ignore */ }
@@ -485,12 +516,13 @@ const App: React.FC = () => {
 
   // --- DATABASE OPERATIONS ---
   const saveDatabase = async () => {
-      if (!dbFilePath || !window.electron) return;
+      const targetPath = dbFilePathRef.current; // F10: Ref statt State, damit auch alte Callback-Closures korrekt speichern
+      if (!targetPath || !window.electron) return;
       dbRef.current.lastUpdated = Date.now();
       const dbToSave = { ...dbRef.current, basePath: '.' };
       delete dbToSave.dbFilePath; // F8: absoluten Pfad nicht in die DB schreiben (kommt beim Laden aus dem Dateipfad)
       try {
-          const success = await window.electron.saveDatabase(dbFilePath, dbToSave);
+          const success = await window.electron.saveDatabase(targetPath, dbToSave);
           if (!success) addLog("WARNUNG: Datenbank konnte nicht gespeichert werden!", 'error');
           else setScannedDays({ ...dbRef.current.scannedDays }); // Update UI
       } catch (err: any) {
@@ -795,6 +827,23 @@ const App: React.FC = () => {
       }
   };
 
+  // F10: Übersprungenen Eintrag ignorieren (aus DB/Liste entfernen).
+  const handleIgnoreSkipped = async (id: string) => {
+      removeSkippedPhoto(id);
+      await saveDatabase();
+      addLog(`Übersprungen-Eintrag ignoriert: ${id}`, 'info');
+  };
+
+  // F10: Alle übersprungenen Einträge ignorieren.
+  const handleIgnoreAllSkipped = async () => {
+      const count = Object.keys(dbRef.current.skippedDownloads || {}).length;
+      if (count === 0) return;
+      dbRef.current.skippedDownloads = {};
+      setSkippedPhotos({});
+      await saveDatabase();
+      addLog(`${count} übersprungene Einträge ignoriert.`, 'info');
+  };
+
   const executeResolveDuplicates = async () => {
       if (!exportPath || !integrityResult || integrityResult.duplicates.length === 0) return;
       if (!confirm(`Duplikat-Bereinigung starten?\n\nEs werden nur Offline-Kopien gelöscht (Einträge, die online nicht mehr gefunden wurden). Online vorhandene Google-Fotos bleiben immer erhalten.`)) return;
@@ -849,10 +898,12 @@ const App: React.FC = () => {
       // 2. Clear State
       setExportPath(null);
       setDbFilePath(null);
+      dbFilePathRef.current = null;
       setLogs([]);
       setDownloadedFiles([]);
       setProcessedCount(0);
       setOrphans([]);
+      setSkippedPhotos({}); // F10
       setIntegrityResult(null);
       setBatchCount(0);
       
@@ -864,12 +915,12 @@ const App: React.FC = () => {
       setRenamableFiles([]); 
       
       // 3. Clear Refs
-      dbRef.current = { basePath: '', lastUpdated: 0, files: {}, scannedDays: {}, hashScheme: 2 };
+      dbRef.current = { basePath: '', lastUpdated: 0, files: {}, scannedDays: {}, skippedDownloads: {}, hashScheme: 2 };
       processedIdsRef.current = new Set();
       activeDownloadsRef.current = 0;
       setActiveDownloadsCount(0);
       setActiveProgress({});
-      pendingStartResolvers.current.clear();
+      cancelPendingStarts(); // F10: offene Starts sofort auflösen (Reset)
       isAlbumModeRef.current = false;
       albumTargetPathRef.current = null;
       prevTrueMetaRef.current = null;
@@ -889,6 +940,7 @@ const App: React.FC = () => {
   const clearCacheAndLogout = async () => {
       if (webviewRef.current) {
           isWalkingRef.current = false;
+          cancelPendingStarts(); // F10: offene Starts auflösen (Logout)
           addLog("Lösche Cache...", 'info');
           try {
             await window.electron.clearSessionCache();
@@ -899,10 +951,54 @@ const App: React.FC = () => {
       }
   };
 
+  // --- F10: Pending-Start-Verwaltung ---
+
+  // Löst alle offenen Start-Wartevorgänge sofort auf (Reset/Logout/Session-Ende, ohne Warnlog).
+  const cancelPendingStarts = () => {
+      pendingStartResolvers.current.forEach((resolve) => resolve(false));
+      pendingStartResolvers.current.clear();
+  };
+
+  // F10b: Vor einem neuen prepareDownload muss die vorherige Config geklärt sein
+  // (Singleton-Schutz in main.cjs), sonst könnte ein später Start die neue Config erben.
+  const discardPendingStarts = async () => {
+      if (pendingStartResolvers.current.size === 0) return;
+      pendingStartResolvers.current.forEach((resolve) => resolve(false));
+      pendingStartResolvers.current.clear();
+      await window.electron.cancelPendingDownload();
+  };
+
+  // F10: Foto nach Start-Timeout als "übersprungen" vormerken (persistiert in der DB).
+  const recordSkippedPhoto = (info: any, isAlbumDownload: boolean) => {
+      const id = info?.id;
+      if (!id) return;
+      const webTs = parseGoogleDateString(info.dateStr || '').getTime();
+      if (!dbRef.current.skippedDownloads) dbRef.current.skippedDownloads = {};
+      dbRef.current.skippedDownloads[id] = {
+          id,
+          webTimestamp: isNaN(webTs) ? 0 : webTs,
+          filename: info.potentialFilename || undefined,
+          detectedAt: Date.now(),
+          mode: isAlbumDownload ? 'album' : 'backup'
+      };
+      setSkippedPhotos({ ...dbRef.current.skippedDownloads });
+      void saveDatabase();
+  };
+
+  // F10: Nach erfolgreichem Download bzw. Ignorieren austragen.
+  // Rückgabe: true, wenn tatsächlich ein Eintrag entfernt wurde (für sofortiges Persistieren).
+  const removeSkippedPhoto = (id: string): boolean => {
+      if (!dbRef.current.skippedDownloads || !dbRef.current.skippedDownloads[id]) return false;
+      delete dbRef.current.skippedDownloads[id];
+      setSkippedPhotos({ ...dbRef.current.skippedDownloads });
+      return true;
+  };
+
   // --- CORE CRAWLER LOGIC ---
-  const initiateDownloadAsync = async (info: any, savePath: string, isAlbumDownload: boolean = false, trusted: boolean = true): Promise<void> => {
+  // F10: startTimeoutMs === null (Einzeldownload) -> kein Limit, wartet bis zum Start.
+  const initiateDownloadAsync = async (info: any, savePath: string, isAlbumDownload: boolean = false, trusted: boolean = true, startTimeoutMs: number | null = DOWNLOAD_START_TIMEOUT_MS): Promise<boolean> => {
       const webDate = parseGoogleDateString(info.dateStr || "");
-      if (isNaN(webDate.getTime())) return;
+      if (isNaN(webDate.getTime())) return false;
       
       await window.electron.prepareDownload({
           id: info.id,
@@ -912,24 +1008,29 @@ const App: React.FC = () => {
           trusted
       });
 
-      // F3 (A1): Resolver meldet, OB der Download gestartet ist (verhindert Slot-Leak bei Timeout)
+      // F3 (A1) + F10: Resolver meldet, OB der Download gestartet ist (verhindert Slot-Leak bei Timeout).
       const startPromise = new Promise<boolean>((resolve) => {
-          pendingStartResolvers.current.set(info.id, () => resolve(true));
-          setTimeout(() => {
-              if (pendingStartResolvers.current.has(info.id)) {
-                  console.error("Timeout waiting for download start:", info.id);
-                  pendingStartResolvers.current.delete(info.id);
-                  resolve(false);
-              }
-          }, 15000);
+          pendingStartResolvers.current.set(info.id, (started: boolean) => resolve(started));
+          if (startTimeoutMs !== null) {
+              setTimeout(() => {
+                  if (pendingStartResolvers.current.has(info.id)) {
+                      pendingStartResolvers.current.delete(info.id);
+                      console.error("Timeout waiting for download start:", info.id);
+                      addLog(`Download-Start fehlgeschlagen (Timeout): ${info.id}`, 'warning');
+                      recordSkippedPhoto(info, isAlbumDownload); // F10
+                      resolve(false);
+                  }
+              }, startTimeoutMs);
+          }
       });
 
       await Crawler.triggerDownloadKeys(webviewRef.current);
       const started = await startPromise;
 
       if (!started) {
-          addLog(`Download-Start fehlgeschlagen (Timeout): ${info.id}`, 'warning');
-          return; // keinen Slot belegen, ID nicht als verarbeitet markieren
+          // F10: Config entwerten, damit ein später eintreffender Start sie nicht mehr erben kann.
+          await window.electron.cancelPendingDownload();
+          return false; // keinen Slot belegen, ID nicht als verarbeitet markieren
       }
       
       activeDownloadsRef.current += 1;
@@ -937,6 +1038,7 @@ const App: React.FC = () => {
       if (!isAlbumDownload) {
           processedIdsRef.current.add(info.id);
       }
+      return true;
   };
 
   const getUrlContextType = (url: string): 'main' | 'album' | 'share' | 'search' => {
@@ -1000,8 +1102,9 @@ const App: React.FC = () => {
           }
 
           if (needsDownload) {
-              await initiateDownloadAsync(result, exportPath, false);
-              addLog(`Download für ${result.id} angefordert.`, 'info');
+              await discardPendingStarts(); // F10b: alten offenen Einzel-Start verwerfen
+              const started = await initiateDownloadAsync(result, exportPath, false, true, null); // F10b: Einzeldownload ohne Limit
+              if (started) addLog(`Download für ${result.id} angefordert.`, 'info');
           }
 
       } catch (e: any) {
@@ -1081,7 +1184,7 @@ const App: React.FC = () => {
       
       setIsWalking(false); 
       addLog("Backup-Vorgang beendet.", 'success');
-      pendingStartResolvers.current.clear();
+      cancelPendingStarts(); // F10: defensiv (offene Starts sollten bereits abgeschlossen sein)
   };
 
   const updateRangeTracking = (timestamp: number) => {
@@ -1187,6 +1290,7 @@ const App: React.FC = () => {
     panelScrolledRef.current = false;
     pendingInfoRef.current = null;
     desyncAbortRef.current = false;
+    await discardPendingStarts(); // F10b: alten offenen Einzel-Start vor der Session klären
 
     if (isAlbumMode) {
       addLog(`[ALBUM] Starte separaten Album-Download nach ${albumTargetPathRef.current}...`, 'album');
@@ -1563,7 +1667,7 @@ const App: React.FC = () => {
         isAlbumModeRef.current = false;
         albumTargetPathRef.current = null;
         addLog('[ALBUM] Album-Download beendet.', 'album');
-        pendingStartResolvers.current.clear();
+        cancelPendingStarts(); // F10: defensiv
     } else {
         await finishBackupSession(desyncAbortRef.current);
     }
@@ -1572,7 +1676,8 @@ const App: React.FC = () => {
   if (!isInitialized) return <StartupScreen onLoadDatabase={handleInitLoadDatabase} onNewDatabase={handleInitNewDatabase} />;
 
   const duplicateCount = integrityResult?.duplicates?.length || 0;
-  const hasCorrections = orphans.length > 0 || corruptFilesCount > 0;
+  const skippedCount = Object.keys(skippedPhotos).length; // F10
+  const hasCorrections = orphans.length > 0 || corruptFilesCount > 0 || skippedCount > 0;
 
   return (
     <div className="flex flex-col h-screen bg-slate-900 text-slate-100 overflow-hidden relative">
@@ -1589,6 +1694,7 @@ const App: React.FC = () => {
           <CorrectionModal 
               orphans={orphans} 
               files={dbRef.current.files}
+              skipped={Object.values(skippedPhotos).sort((a, b) => b.detectedAt - a.detectedAt)}
               onClose={() => setShowCorrectionModal(false)}
               onDeleteOrphans={executeDeleteOrphans}
               onResetOrphans={executeResetOrphans}
@@ -1596,6 +1702,9 @@ const App: React.FC = () => {
               onDeleteCorrupt={handleRemoveCorruptFile}
               onDeleteAllCorrupt={executeDeleteAllCorrupt}
               onNavigate={handleOpenMissingPhoto}
+              onOpenSkipped={handleOpenMissingPhoto}
+              onIgnoreSkipped={handleIgnoreSkipped}
+              onIgnoreAllSkipped={handleIgnoreAllSkipped}
           />
       )}
 
@@ -1685,7 +1794,7 @@ const App: React.FC = () => {
                     className="bg-red-700 hover:bg-red-600 text-white font-bold px-2 py-2 rounded text-xs border border-red-500 shadow-lg animate-pulse mb-1 flex items-center justify-between"
                  >
                      <span>🛠️ Korrekturen</span>
-                     <span className="bg-white/20 px-1.5 rounded text-[10px]">{orphans.length + corruptFilesCount}</span>
+                     <span className="bg-white/20 px-1.5 rounded text-[10px]">{orphans.length + corruptFilesCount + skippedCount}</span>
                  </button>
             )}
 

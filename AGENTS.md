@@ -115,19 +115,22 @@ dist/, release/              Build-Artefakte (via .gitignore ausgeschlossen)
         * `originalName` aus Panel-Filename aktualisieren (nur wenn „trusted“, siehe Abschnitt 9).
         * Weicht `entry.timestamp` um > 60 s vom Web-Datum ab → Datei verschieben/umschreiben via `moveAndUpdateFile` – **nur mit Hash-Gate** (siehe 6.3). Ohne gespeicherten Hash wird dieser erst nachgetragen und die Korrektur auf den nächsten Lauf verschoben.
         * `scannedAt = Date.now()`.
-   f. **Download anstoßen** (`initiateDownloadAsync`): `prepareDownload(config)` → `triggerDownloadKeys(webview)` (simuliert **Shift+D**) → warten auf `download-started`-Event (max. 15 s Timeout). Nur bei echtem Start: `activeDownloads` erhöhen + ID zu `processedIdsRef` hinzufügen; bei Timeout Warnlog und **kein** Slot belegen (F3, verhindert Slot-Leak).
+   f. **Download anstoßen** (`initiateDownloadAsync`): `prepareDownload(config)` → `triggerDownloadKeys(webview)` (simuliert **Shift+D**) → blockierend warten auf `download-started` (max. **45 s**, F10). Nur bei echtem Start: `activeDownloads` erhöhen + ID zu `processedIdsRef` hinzufügen. Bei Timeout (F3/F10): Warnlog, Eintrag in `db.skippedDownloads[id]` (persistiert), `cancelPendingDownload` entwertet die Config, **kein** Slot/`processedIds`; die Navigation läuft erst nach Start oder Timeout weiter. Ein später eintreffender Download wird vom Main-Prozess verworfen. Einzeldownload („⬇ 1“) übergibt `startTimeoutMs = null` → **kein Limit** (F10b).
    g. **Navigation:** `navigateNext` (ArrowRight) + `killVideoPlayers`, dann bis zu 30× à 200 ms prüfen, ob die URL-ID wechselt (`navigateAndVerifyChange`). Anschließend wartet `waitForPanelRefresh` (F1, 150 ms-Poll, max. 3 s) darauf, dass das Info-Panel zum neuen Foto wechselt (F1.3-Namens-Anker gegen Ein-Schritt-Lag). Bei Nicht-Erfolg: bis zu 2 Resyncs (prev/next); bleibt es stale → Session-Abbruch (F1.3). Kein ID-Wechsel nach 6 s → Loop bricht ab (vermutlich Bibliotheksende).
 5. Nach dem Loop: auf alle aktiven Downloads warten.
 6. `finishBackupSession()` (nur Haupt-Backup): `checkForOrphans()` + DB speichern + Log „Backup-Vorgang beendet.“
    - `checkForOrphans` (F2): prüft DB-Einträge, deren `timestamp` in **kompletten gescannten Tagen** liegt (safeStart = Min-Datum + 1 Tag um 00:00, safeEnd = Max-Datum um 00:00) und deren ID nicht in `sessionSeenIds` ist. Existiert die Datei lokal nicht → `missingSince`; existiert sie lokal, wurde aber online nicht gesehen → `onlineMissingSince` (Warnlog). Bereits markierte Einträge werden übersprungen.
-7. „⏹ Stop“ setzt `isWalkingRef=false` und speichert sicherheitshalber.
+7. „⏹ Stop“ setzt `isWalkingRef=false` und speichert sicherheitshalber. Ein offener Start-Wartevorgang läuft bewusst noch bis Start oder 45-s-Timeout zu Ende (F10); Reset/Logout brechen sofort ab (ohne Warnlog).
 
 ### 4.3 Einzel-Download („⬇ 1“)
 - Nur wenn nicht `isWalking`, Zielordner vorhanden und URL-Kontext nicht Suche/Album/Share.
 - Liest Metadaten (ggf. Infopanel-Toggle), prüft DB + physische Existenz, lädt sonst einzeln herunter. **Trusted ist hier immer `true`** (kein Stale-Panel-Detektor).
+- **F10b:** wartet **ohne Zeitlimit** auf den Start; davor werden offene frühere Einzel-Starts verworfen (`discardPendingStarts` → `cancelPendingDownload`).
 - Kein Album-/Scan-Tracking.
 
 ### 4.4 Download-Ergebnis (Frontend `onDownloadComplete`)
+- Bei Erfolg wird die ID aus `skippedDownloads` entfernt (F10). War ein Eintrag betroffen (z. B. manueller Nachlade-Download), wird die DB **sofort gespeichert** – aber erst **am Ende** des Success-Blocks, nachdem der neue `files`-Eintrag geschrieben wurde (sonst fehlt er im Snapshot); sonst gelten weiterhin die regulären Speicherpunkte.
+- `saveDatabase` liest den DB-Pfad aus `dbFilePathRef` (nicht aus dem State), damit auch Callback-Closures des ersten Renders (dieser Listener) korrekt speichern können.
 - Haupt-Backup: Eintrag in `dbRef.current.files[id]` mit `filename`, `originalName`, `timestamp` (= finales Datum), `savedAt`, `downloadedAt`, `scannedAt`, `originalDate` (EXIF-String), `hash`, `sourceHash`. **`integrityStatus` wird absichtlich NICHT gesetzt** → Datei gilt als „ungeprüft“.
 - Album-Modus: **kein DB-Eintrag**, nur Log + Anzeige in der „Neue Dateien“-Liste (max. letzte 100).
 - Vergleich Web-Datum ↔ Original-EXIF: Abweichung > 60 s → UI-Status „Manuell“ (⚠) und Warn-Log; sonst „OK“ (✔).
@@ -138,8 +141,8 @@ dist/, release/              Build-Artefakte (via .gitignore ausgeschlossen)
 ## 5. Download-Pipeline im Main-Prozess (`main.cjs`)
 
 ### 5.1 `will-download`-Handler
-- Reagiert nur, wenn `nextDownloadConfig.active === true` (Werte kommen via `prepare-download`). Ungeplante Downloads werden ignoriert (return, kein Tracking).
-- `nextDownloadConfig` ist ein **globaler Singleton**; deshalb wartet das Frontend nach `triggerDownloadKeys` auf das `download-started`-Signal, bevor die nächste ID vorbereitet wird.
+- Reagiert nur, wenn `nextDownloadConfig.active === true` (Werte kommen via `prepare-download`). Ungeplante/verspätete Downloads werden **verworfen** (`event.preventDefault()`, F10; kein Speichern-Dialog, kein Tracking) und geloggt (`Ungeplanter Download verworfen`).
+- `nextDownloadConfig` ist ein **globaler Singleton**; deshalb wartet das Frontend, bevor die nächste ID vorbereitet wird: in der Schleife blockierend auf Start/Timeout, vor Einzeldownloads/Session-Start per `discardPendingStarts`. `cancel-pending-download` entwertet die Config bei Timeout/Reset/Logout.
 - Pfadlogik:
   - Normal: `<targetDir>/<YYYY>/<MM>/`
   - Album (`flatStructure: true`): direkt `<targetDir>/` (also z. B. `…/Alben/Urlaub_2024/`)
@@ -179,6 +182,7 @@ dist/, release/              Build-Artefakte (via .gitignore ausgeschlossen)
   "lastUpdated": 1234567890,
   "hashScheme": 2,              // 2 = hash/sourceHash getrennt
   "scannedDays": { "2024-05-01": 1714590000000 },   // Tag -> Zeitpunkt des letzten Scans
+  "skippedDownloads": { "<GooglePhotoId>": { "id": "…", "webTimestamp": 1714590000000, "filename": "IMG_1234.jpg", "detectedAt": 1714590000000, "mode": "backup|album" } }, // F10
   "files": {
     "<GooglePhotoId>": {
       "filename": "IMG_1234.jpg",      // lokaler Name (inkl. evtl. "(n)")
@@ -203,6 +207,7 @@ dist/, release/              Build-Artefakte (via .gitignore ausgeschlossen)
 - `basePath` im JSON ist nur informativ; der echte Basisordner wird beim Laden aus dem Dateipfad abgeleitet.
 - `hashScheme`-Migration 1→2 passiert automatisch in `handleInitLoadDatabase` (App.tsx).
 - Die UI führt `processedIdsRef = Set(Object.keys(db.files))` mit; das ist die bekannte ID-Menge der Session.
+- `skippedDownloads` (F10): Fotos, deren Download-Start nicht innerhalb von 45 s bestätigt wurde (Key = **Google Photo ID**). Quelle der Sektion „Übersprungen“ im Korrektur-Modal; wird bei erfolgreichem Download/„Ignorieren“ entfernt und beim Laden gegen `files` bereinigt (selbstheilend). Einträge besitzen bewusst **keinen** `files`-Eintrag.
 
 ### 6.2 Speichern & Backups
 - `saveDatabase` ruft IPC `save-database`; dieses schreibt `JSON.stringify(data, null, 2)` und ruft vorher `maybeBackupDatabase`.
@@ -260,6 +265,7 @@ Schreibt `YYYY:MM:DD HH:MM:SS` in:
 ### 8.3 Korrektur-Modal
 - **Vermisste Dateien (Orphans):** aus DB löschen (Cleanup) oder „Status zurücksetzen“ (ignorieren) oder „🌐 Web öffnen“ (`https://photos.google.com/photo/<id>` im Webview → Nutzer kann manuell neu herunterladen; Modal schließt).
 - **Defekte Dateien:** „Löschen“ entfernt die Datei **physisch**, der DB-Eintrag bleibt bewusst bestehen (ohne `integrityStatus`/`hash`) → beim nächsten Backup wird sie neu geladen. „Alle von Festplatte löschen“ als Batch.
+- **Übersprungene Downloads (F10):** Fotos mit Start-Timeout (kein `files`-Eintrag; Key = Google-ID). „🌐 Web öffnen“ lädt `https://photos.google.com/photo/<id>` im Webview (Modal schließt; danach „⬇ 1“ ohne Zeitlimit), „✖ Ignorieren“/„Alle ignorieren“ entfernt den Eintrag aus `skippedDownloads` (DB-Save).
 - **`onlineMissingSince`** (F2) wird derzeit nur im Log/DB geführt; Anzeige im Modal folgt in der UI-Phase.
 
 ### 8.4 Namensbereinigung (IPC `find-renamable-files` / „✨ Dateinamen bereinigen“)
@@ -365,6 +371,7 @@ Alle Kanalnamen exakt so (main.cjs `ipcMain`):
 | `findRenamableFiles` | `find-renamable-files` | invoke | Rename-Kandidaten |
 | `verifyFileIntegrityBatch` | `verify-file-integrity-batch` | invoke | Deep Scan |
 | `prepareDownload` | `prepare-download` | invoke | Setzt `nextDownloadConfig` |
+| `cancelPendingDownload` | `cancel-pending-download` | invoke | Entwertet offene Download-Config (F10) |
 | `onDownloadStarted` | `download-started` | on | Slot-Freigabe |
 | `onDownloadComplete` | `download-complete` | on | Ergebnis |
 | `onDownloadProgress` | `download-progress` | on | Fortschritt |
@@ -388,7 +395,7 @@ Alle Kanalnamen exakt so (main.cjs `ipcMain`):
   - Download-Fortschrittsbalken (links oben, bis 5 gleichzeitig).
   - „Turbo Backup“-Panel (rechts oben): `processedCount`, aktive Downloads x/5, Batch x/1000.
 - **Untere Leiste (h-64):**
-  - Links: Status, Scan-Historie-Button, Duplikat-Warnung, „Datenbank prüfen“, „Dateinamen bereinigen“, „Korrekturen“ (rot, wenn Orphans/Corrupt), CSV-Export, Reset, Logout, Start/Stop, „⬇ 1“.
+  - Links: Status, Scan-Historie-Button, Duplikat-Warnung, „Datenbank prüfen“, „Dateinamen bereinigen“, „Korrekturen“ (rot, wenn Orphans/Corrupt/Übersprungene), CSV-Export, Reset, Logout, Start/Stop, „⬇ 1“.
   - Mitte: Log-Fenster (nur relevante Meldungen, max. 300 Einträge, Button „Logs“ öffnet Ordner).
   - Rechts: Liste „Neue Dateien“ (max. letzte 100, Web vs. Original-Datum, ✔/⚠).
 - **Log-Filterung** (`addLog`): Alles geht an Konsole/Logdatei, aber die UI zeigt nur `error/success/warning/album` sowie Meldungen mit Schlüsselwörtern (Backup, Datenbank, Bereinigung, Status, Web, Bereits, Bekannt, vermisst, Warte, Umbenannt, Verschoben, Metadaten, Tageswechsel, Batch, Scan-Log). Debug nur Konsole.
@@ -428,14 +435,14 @@ Diese Punkte sind bewusst dokumentiert, damit Agenten sie nicht für funktionier
 8. **Windows-only-Annahmen:** hartkodierte `\\`-Pfade (Alben), PowerShell für CreationTime, Backslash-/Separator-Erkennung über `includes('\\')`.
 9. **Extension-Listen müssen synchron bleiben:** JPG-Erkennung `.jpg/.jpeg`; Video-Erkennung `.mp4 .mov .m4v .avi .3gp .mpg .mts`. Sie existieren mehrfach (main.cjs Download + move, App.tsx Anzeige-Typ). Bei neuen Formaten alle Stellen prüfen.
 10. **Der Crawler hängt an der Google-Photos-Web-DOM.** Änderungen an Google (aria-labels, Tastenkürzel Shift+D / i / Pfeiltasten, Panel-Layout >70 % Viewportbreite) können den Scraper brechen. `extractCurrentImageInfo` ist die zentrale Stelle.
-11. **Kein automatisches Timeout für den gesamten Download** – nur Start-Timeout 15 s und 3-s-Timeout beim Scraping. Hängende Downloads können die 5-Slot-Grenze blockieren.
+11. **Kein automatisches Timeout für den gesamten Download** – Start-Timeout **45 s** im Haupt-Backup (F10), Einzeldownload **ohne Limit** (F10b), 3-s-Timeout beim Scraping. Hängende Downloads können die 5-Slot-Grenze blockieren.
 12. **DB wird bei Download-Complete nur im Speicher aktualisiert**, persistiert erst durch nachfolgendes `saveDatabase()` (Autosave 30 s / Tageswechsel / Session-Ende). Ein harter Absturz kann die letzten Sekunden verlieren (dafür gibt es die Backups alle 10 min).
 
 ### 14.1 Bekannte offene Logikfehler (Review-Liste, werden in Phase 2 einzeln abgearbeitet)
 
 | # | Prio | Problem | Ort |
 |---|---|---|---|
-| A1 | kritisch | ~~Download-Slot-Leak: Bei `download-started`-Timeout wird trotzdem `activeDownloadsRef++` + `processedIdsRef.add()` ausgeführt~~ **behoben in F3**: Resolver liefert `boolean`; nur bei echtem Start wird der Slot belegt. Offen: keine automatischen Retries im Timeout-Fall (nächster Lauf holt das Foto nach) | App.tsx `initiateDownloadAsync` |
+| A1 | kritisch | ~~Download-Slot-Leak: Bei `download-started`-Timeout wird trotzdem `activeDownloadsRef++` + `processedIdsRef.add()` ausgeführt~~ **behoben in F3**: Resolver liefert `boolean`; nur bei echtem Start wird der Slot belegt. Timeout-Fälle landen seit F10 zusätzlich in `skippedDownloads` (Korrektur-Modal) – kein automatischer Retry, aber Einzeldownload/„🌐 Web öffnen“ | App.tsx `initiateDownloadAsync` |
 | A2 | kritisch | ~~Endlosschleife im `catch` der Backup-Schleife: fehlendes `break`, wenn `navigateAndVerifyChange` nach einer Exception scheitert~~ **behoben in F4**: bei fehlgeschlagener Navigation bricht der `catch` mit eindeutiger Meldung ab | App.tsx `runBackupSession` |
 | A3 | mittel | ~~Trust-Detektor: `matchesOwn` prüft nur `entry.originalDate` → Minuten-Bursts dauerhaft `trusted=false`~~ **behoben in F1** (Panel-Refresh-Wait, `entry.timestamp`-Fallback, Kaskaden-Fix, harte Namenssperre). Offen bleibt die Datenpflege der bereits korrupten `originalName`-Altfälle (s. Analyse) | App.tsx `evaluateScrapeTrust` |
 | A4 | mittel | ~~Namenskollisions-Race: `(n)`-Prüfung via `existsSync` vor physischer Dateierstellung; parallele Gleichnamige können denselben Zielpfad erhalten → Overwrite~~ **behoben in F5**: `reservedTargetPaths`-Set reserviert Zielpfade bis zum Download-Ende | main.cjs `will-download` |
@@ -447,6 +454,7 @@ Diese Punkte sind bewusst dokumentiert, damit Agenten sie nicht für funktionier
 | A10 | klein | `handleShowFileInExplorer` → `onShowInFolder`-Prop ist tote Kette (CorrectionModal nutzt sie nie) | App.tsx / ActionModals.tsx |
 | K4 | mittel | ~~Duplikat-Lösch-/Re-Download-Zyklus durch Dateinamen-Heuristik bei gleichnamigen Google-Fotos~~ **behoben in F6**: nur Hash-Duplikate; Online-Einträge werden nie gelöscht | main.cjs `check-db-integrity`, databaseUtils `resolveDuplicatesOnDisk` |
 | K5 | kritisch | ~~Ein-Schritt-Lag: Panel-Refresh-Wait akzeptierte das Vorgängerfoto als „refreshed" (nur Signaturänderung geprüft) → jedes Foto bekam das Google-Datum des Vorgängers; Lag perpetuierte sich; `trusted=true` schrieb Falschdaten in EXIF/FS/DB~~ **behoben in F1.3/F1.4**: Namens-Anker + Resync (mit URL-Verifikation) + Session-Abbruch bei nicht behebbarem Desync; deterministischer Start per `loadURL` + Panel-Öffnungs-Check (der F1.3-Nudge erwies sich als Sackgasse und wurde entfernt). **Zusatzursache gefunden/behoben:** Der F1.2-Teilscan über den gecachten Panel-Container lieferte veraltete Panel-Inhalte (sichtbarer Panel war aktuell) → F1.2-Teilscan zurückgebaut, Vollscan wieder aktiv; `pendingInfo` bleibt. | App.tsx `waitForPanelRefresh`, `navigateAndVerifyChange`, `runBackupSession`, crawlerActions `extractCurrentImageInfo` |
+| F10 | mittel | ~~Große Videos: Google feuert `will-download` erst 11–32 s nach Shift+D; der 15-s-Timeout brach zu früh ab → verfrühte Timeout-Warnungen und (nach früher Folge-Config) Risiko falscher Zuordnung~~ **behoben in F10**: Start-Timeout 45 s; Timeout-Fälle werden in `skippedDownloads` geführt (Korrektur-Modal, „🌐 Web öffnen“, „✖ Ignorieren“); `cancel-pending-download` entwertet die Config; späte Starts werden per `preventDefault` verworfen; Einzeldownload ohne Limit (F10b). Stop wartet bewusst den 45-s-Timeout ab. | App.tsx, main.cjs |
 
 ---
 
@@ -480,6 +488,7 @@ Diese Punkte sind bewusst dokumentiert, damit Agenten sie nicht für funktionier
 | **Turbo-Backup** | Der parallele Crawler-Loop (max. 5 gleichzeitige Downloads) |
 | **Batch** | 1000 Loop-Iterationen, danach Sicherheits-Checkpoint |
 | **scannedDays** | `YYYY-MM-DD` → Scan-Zeitpunkt; Grundlage der Heatmap und Orphan-Prüfung |
+| **Übersprungen / skippedDownloads** | Foto mit Download-Start-Timeout (45 s); Key = Google-ID, gelistet im Korrektur-Modal (F10) |
 | **Hash-Gate** | Pflicht-Hash-Vergleich vor Datei-Mutation |
 | **Stale Panel** | Sidebar zeigt verzögert noch Daten des vorherigen Fotos |
 

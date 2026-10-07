@@ -1,10 +1,11 @@
 
 import React, { useState, useEffect, useMemo } from 'react';
-import { DatabaseEntry, IntegrityResult, RenamableFile } from '../types';
+import { DatabaseEntry, IntegrityResult, RenamableFile, SkippedDownload } from '../types';
 
 interface CorrectionModalProps {
     orphans: { id: string, entry: DatabaseEntry }[];
     files: Record<string, DatabaseEntry>;
+    skipped: SkippedDownload[]; // F10: Fotos mit Download-Start-Timeout
     initialTab?: 'missing' | 'corrupt'; // Kept for API compatibility, but unused
     onClose: () => void;
     
@@ -17,12 +18,18 @@ interface CorrectionModalProps {
     // Corrupt Actions
     onDeleteCorrupt: (id: string) => void; // Single delete corrupt (disk only)
     onDeleteAllCorrupt: () => void; // Batch delete corrupt (disk only)
+
+    // F10: Skipped Actions
+    onOpenSkipped: (id: string) => void; // Im Webview öffnen (Re-Download via "⬇ 1")
+    onIgnoreSkipped: (id: string) => void; // Einzelnen Eintrag entfernen
+    onIgnoreAllSkipped: () => void; // Alle Einträge entfernen
 }
 
 export const CorrectionModal: React.FC<CorrectionModalProps> = ({ 
-    orphans, files, onClose, 
+    orphans, files, skipped, onClose, 
     onDeleteOrphans, onResetOrphans, onNavigate,
-    onDeleteCorrupt, onDeleteAllCorrupt
+    onDeleteCorrupt, onDeleteAllCorrupt,
+    onOpenSkipped, onIgnoreSkipped, onIgnoreAllSkipped
 }) => {
     
     // Live-Berechnung der defekten Dateien
@@ -172,7 +179,70 @@ export const CorrectionModal: React.FC<CorrectionModalProps> = ({
                         </div>
                     )}
 
-                    {orphans.length === 0 && corruptFiles.length === 0 && (
+                    {/* --- SECTION 3: SKIPPED DOWNLOADS (F10) --- */}
+                    {skipped.length > 0 && (
+                        <div className="flex flex-col gap-2">
+                            <div className="flex justify-between items-center pb-2 border-b border-slate-700">
+                                <h4 className="text-lg font-bold text-sky-400">⏭️ Übersprungen – Downloadstart fehlgeschlagen ({skipped.length})</h4>
+                                <div className="text-xs text-slate-400">Kein Start-Signal innerhalb von 45 s</div>
+                            </div>
+                            <div className="bg-sky-900/10 border border-sky-900/30 p-3 rounded text-xs text-slate-300">
+                                Bei diesen Fotos kam nach Shift+D kein Download-Startsignal. Öffne sie im Webview und nutze dort „⬇ 1“ (Einzeldownload ohne Zeitlimit), oder sie werden beim nächsten Backup-Lauf automatisch nachgeladen.
+                            </div>
+                            <div className="border border-slate-700 rounded bg-slate-900/30 max-h-[300px] overflow-y-auto">
+                                <table className="w-full text-left text-xs text-slate-300">
+                                    <thead className="bg-slate-800 text-slate-400 uppercase font-bold sticky top-0">
+                                        <tr>
+                                            <th className="p-2">Erkannt am</th>
+                                            <th className="p-2">Datum (Web)</th>
+                                            <th className="p-2">Dateiname</th>
+                                            <th className="p-2">ID</th>
+                                            <th className="p-2 text-right">Aktion</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {skipped.map((item, idx) => (
+                                            <tr key={idx} className="border-b border-slate-700 hover:bg-slate-800/50">
+                                                <td className="p-2 text-sky-400 whitespace-nowrap">
+                                                    {new Date(item.detectedAt).toLocaleString()}
+                                                    {item.mode === 'album' && <span className="ml-1 text-[9px] bg-purple-900 text-purple-200 px-1 rounded">Album</span>}
+                                                </td>
+                                                <td className="p-2 text-slate-400 whitespace-nowrap">{item.webTimestamp ? new Date(item.webTimestamp).toLocaleDateString() : '—'}</td>
+                                                <td className="p-2 font-mono text-white break-all">{item.filename || '—'}</td>
+                                                <td className="p-2 font-mono text-slate-500 break-all max-w-[180px]" title={item.id}>{item.id}</td>
+                                                <td className="p-2 text-right whitespace-nowrap">
+                                                    <button 
+                                                        onClick={() => onOpenSkipped(item.id)}
+                                                        className="bg-blue-700 hover:bg-blue-600 text-white px-2 py-1 rounded text-[10px] mr-1 font-bold"
+                                                        title="Im Webview öffnen für Einzeldownload"
+                                                    >
+                                                        🌐 Web öffnen
+                                                    </button>
+                                                    <button 
+                                                        onClick={() => onIgnoreSkipped(item.id)}
+                                                        className="bg-slate-600 hover:bg-slate-500 text-white px-2 py-1 rounded text-[10px]"
+                                                        title="Eintrag aus der Liste entfernen"
+                                                    >
+                                                        ✖ Ignorieren
+                                                    </button>
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                            <div className="flex justify-end gap-3 mt-1">
+                                <button 
+                                    onClick={onIgnoreAllSkipped}
+                                    className="bg-slate-700 hover:bg-slate-600 text-white px-4 py-2 rounded text-sm border border-slate-600"
+                                >
+                                    Alle {skipped.length} ignorieren
+                                </button>
+                            </div>
+                        </div>
+                    )}
+
+                    {orphans.length === 0 && corruptFiles.length === 0 && skipped.length === 0 && (
                         <div className="flex flex-col items-center justify-center h-40 text-slate-500 opacity-50">
                             <div className="text-4xl mb-2">✨</div>
                             <div>Alles sauber. Keine Probleme gefunden.</div>

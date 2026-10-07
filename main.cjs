@@ -134,7 +134,10 @@ function createWindow() {
   // --- DOWNLOAD HANDLER (Shift + D Interception) ---
   mainWindow.webContents.session.on('will-download', (event, item, webContents) => {
     if (!nextDownloadConfig.active) {
-        console.log("Ungeplanter Download:", item.getFilename());
+        // F10: Verspätete/verwaiste Downloads verwerfen (kein Speichern-Dialog, keine Zuordnung)
+        event.preventDefault();
+        console.log("Ungeplanter Download verworfen:", item.getFilename());
+        appendLog('warning', `Ungeplanter Download verworfen: ${item.getFilename()}`);
         return;
     }
 
@@ -775,6 +778,13 @@ ipcMain.handle('clear-session-cache', async () => {
 
 ipcMain.handle('prepare-download', async (event, config) => {
     nextDownloadConfig = { active: true, id: config.id, targetDir: config.targetDir, dateTimestamp: config.dateTimestamp, flatStructure: config.flatStructure || false, trusted: config.trusted !== false };
+    return true;
+});
+
+// F10: Entwertet eine noch nicht gestartete Download-Config (Timeout/Reset/Logout).
+// Ein danach eintreffender will-download wird als "Ungeplanter Download" verworfen.
+ipcMain.handle('cancel-pending-download', async () => {
+    nextDownloadConfig.active = false;
     return true;
 });
 

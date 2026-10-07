@@ -27,6 +27,7 @@ contextBridge.exposeInMainWorld('electron', {
 
   // Neue Funktionen für Shift+D Flow
   prepareDownload: (config) => ipcRenderer.invoke('prepare-download', config),
+  cancelPendingDownload: () => ipcRenderer.invoke('cancel-pending-download'), // F10
   onDownloadStarted: (callback) => {
       const listener = (event, id) => callback(id);
       ipcRenderer.on('download-started', listener);
