@@ -13,6 +13,9 @@ import { ScanHeatmapModal } from './components/ScanHeatmap';
 // Danach wird die Config entwertet und das Foto in skippedDownloads geführt.
 const DOWNLOAD_START_TIMEOUT_MS = 45000;
 
+// F14: true = Trust-Zeile für jedes Foto (Diagnose). Standard: nur bei Auffälligkeiten.
+const VERBOSE_TRUST_LOG = false;
+
 const App: React.FC = () => {
   // --- UI State ---
   const [isInitialized, setIsInitialized] = useState(false);
@@ -54,6 +57,7 @@ const App: React.FC = () => {
   // --- Orphans, Duplicates & Missing ---
   const [orphans, setOrphans] = useState<{id: string, entry: DatabaseEntry}[]>([]);
   const [skippedPhotos, setSkippedPhotos] = useState<Record<string, SkippedDownload>>({}); // F10
+  const [onlineMissing, setOnlineMissing] = useState<{id: string, entry: DatabaseEntry}[]>([]); // F13
   const [integrityResult, setIntegrityResult] = useState<IntegrityResult | null>(null);
   const [renamableFiles, setRenamableFiles] = useState<RenamableFile[]>([]); // NEU
   
@@ -429,7 +433,16 @@ const App: React.FC = () => {
       setSkippedPhotos({ ...skipped });
   };
 
-  useEffect(() => { if (isInitialized) { updateOrphansList(); updateSkippedList(); } }, [isInitialized]);
+  // F13: Online nicht gefundene Dateien (Datei lokal vorhanden) in den UI-State spiegeln.
+  // Einträge mit missingSince laufen in der Orphan-Sektion (Vorrang), daher hier ausgeschlossen.
+  const updateOnlineMissingList = () => {
+      const list = (Object.entries(dbRef.current.files || {}) as [string, DatabaseEntry][])
+          .filter(([_, entry]) => !!entry.onlineMissingSince && !entry.missingSince)
+          .map(([id, entry]) => ({ id, entry }));
+      setOnlineMissing(list);
+  };
+
+  useEffect(() => { if (isInitialized) { updateOrphansList(); updateSkippedList(); updateOnlineMissingList(); } }, [isInitialized]);
 
   // F11: Sekunden-Ticker nur, solange eine Wartekarte sichtbar ist.
   const hasWaitingProgress = Object.values(activeProgress).some(p => p.waiting);
@@ -528,6 +541,7 @@ const App: React.FC = () => {
         dbFilePathRef.current = filePath;
         setOrphans([]);
         setSkippedPhotos({});
+        setOnlineMissing([]); // F13 (leere DB -> leere Liste)
         
         let existing = null;
         try { existing = await window.electron.loadDatabase(filePath); } catch (e) { /* ignore */ }
@@ -857,6 +871,52 @@ const App: React.FC = () => {
       }
   };
 
+  // F13: Online-nicht-gefunden-Einträge behalten (Status zurücksetzen).
+  const executeResetOnlineMissing = async () => {
+      if (onlineMissing.length === 0) return;
+      addLog(`Setze Status für ${onlineMissing.length} online-nicht-gefundene Dateien zurück...`, 'info');
+      try {
+          onlineMissing.forEach(o => {
+              if (dbRef.current.files[o.id]) delete dbRef.current.files[o.id].onlineMissingSince;
+          });
+          await saveDatabase();
+          updateOnlineMissingList();
+          addLog("Status zurückgesetzt. Dateien gelten wieder als synchron.", 'success');
+      } catch (e: any) {
+          addLog("Fehler bei Reset: " + e.message, 'error');
+      }
+  };
+
+  // F13: Online-nicht-gefunden-Dateien lokal löschen (Datei + DB-Eintrag; F7-Muster).
+  const executeDeleteAllOnlineMissing = async () => {
+      if (!exportPath || onlineMissing.length === 0) return;
+      if (!confirm(`Wirklich alle ${onlineMissing.length} Dateien von der Festplatte löschen und aus der DB entfernen?`)) return;
+
+      addLog(`Lösche ${onlineMissing.length} online-nicht-gefundene Dateien von Disk...`, 'info');
+      let deletedCount = 0;
+      let failedCount = 0;
+      for (const item of onlineMissing) {
+          try {
+              const deleted = await window.electron.deleteFile({
+                  basePath: exportPath,
+                  filename: item.entry.filename,
+                  timestamp: item.entry.timestamp
+              });
+              if (!deleted) {
+                  failedCount++;
+                  addLog(`Löschen fehlgeschlagen (DB unverändert): ${item.entry.filename}`, 'warning');
+                  continue;
+              }
+              delete dbRef.current.files[item.id];
+              processedIdsRef.current.delete(item.id);
+              deletedCount++;
+          } catch (e) { console.error(e); failedCount++; }
+      }
+      await saveDatabase();
+      updateOnlineMissingList();
+      addLog(`${deletedCount} Dateien lokal + in DB gelöscht.${failedCount > 0 ? ` ${failedCount} fehlgeschlagen (siehe Warnungen).` : ''}`, failedCount > 0 ? 'warning' : 'success');
+  };
+
   // F10: Übersprungenen Eintrag ignorieren (aus DB/Liste entfernen).
   const handleIgnoreSkipped = async (id: string) => {
       removeSkippedPhoto(id);
@@ -934,6 +994,7 @@ const App: React.FC = () => {
       setProcessedCount(0);
       setOrphans([]);
       setSkippedPhotos({}); // F10
+      setOnlineMissing([]); // F13
       setIntegrityResult(null);
       setBatchCount(0);
       
@@ -1211,6 +1272,7 @@ const App: React.FC = () => {
           }
       }
       if (markedLocal > 0) updateOrphansList();
+      if (markedOnline > 0) updateOnlineMissingList(); // F13
       if (markedLocal > 0 || markedOnline > 0) {
           addLog(`${markedLocal} Dateien lokal vermisst, ${markedOnline} online nicht gefunden.`, markedLocal > 0 ? 'error' : 'warning');
       } else {
@@ -1592,7 +1654,11 @@ const App: React.FC = () => {
                             let metaUpdated = false;
                             const trustInfo = evaluateScrapeTrust(panelRefreshedRef.current, result, webTimestamp, existingEntry);
                             trustedForPhoto = trustInfo.trusted;
-                            addLog(`Trust: refreshed=${panelRefreshedRef.current} synced=${panelSyncedRef.current} reason=${trustInfo.reason || '-'} id=${result.id}`, 'debug');
+                            // F14: nur bei Auffälligkeiten loggen (Vollprotokoll via VERBOSE_TRUST_LOG)
+                            const trustProblem = !trustInfo.trusted || trustInfo.reason !== '' || (!panelRefreshedRef.current && !!prevTrueMetaRef.current);
+                            if (VERBOSE_TRUST_LOG || trustProblem) {
+                                addLog(`Trust: refreshed=${panelRefreshedRef.current} synced=${panelSyncedRef.current} reason=${trustInfo.reason || '-'} id=${result.id}`, 'debug');
+                            }
 
                             if (existingEntry.missingSince) {
                                  delete existingEntry.missingSince; 
@@ -1602,6 +1668,7 @@ const App: React.FC = () => {
                             if (existingEntry.onlineMissingSince) {
                                  delete existingEntry.onlineMissingSince;
                                  metaUpdated = true;
+                                 updateOnlineMissingList(); // F13: UI-Liste aktualisieren
                                  addLog(`✅ Status korrigiert: ${existingEntry.filename} wieder online gesehen.`, 'success');
                             }
 
@@ -1680,7 +1747,11 @@ const App: React.FC = () => {
                 if (!isAlbumMode) {
                     const trustInfo = evaluateScrapeTrust(panelRefreshedRef.current, result, webTimestamp, dbRef.current.files[result.id]);
                     trustedForPhoto = trustInfo.trusted;
-                    addLog(`Trust: refreshed=${panelRefreshedRef.current} synced=${panelSyncedRef.current} reason=${trustInfo.reason || '-'} id=${result.id}`, 'debug');
+                    // F14: nur bei Auffälligkeiten loggen (Vollprotokoll via VERBOSE_TRUST_LOG)
+                    const trustProblem = !trustInfo.trusted || trustInfo.reason !== '' || (!panelRefreshedRef.current && !!prevTrueMetaRef.current);
+                    if (VERBOSE_TRUST_LOG || trustProblem) {
+                        addLog(`Trust: refreshed=${panelRefreshedRef.current} synced=${panelSyncedRef.current} reason=${trustInfo.reason || '-'} id=${result.id}`, 'debug');
+                    }
                 }
                 await initiateDownloadAsync(result, targetPath, isAlbumMode, trustedForPhoto);
             }
@@ -1737,7 +1808,8 @@ const App: React.FC = () => {
 
   const duplicateCount = integrityResult?.duplicates?.length || 0;
   const skippedCount = Object.keys(skippedPhotos).length; // F10
-  const hasCorrections = orphans.length > 0 || corruptFilesCount > 0 || skippedCount > 0;
+  const onlineMissingCount = onlineMissing.length; // F13
+  const hasCorrections = orphans.length > 0 || corruptFilesCount > 0 || skippedCount > 0 || onlineMissingCount > 0;
 
   // F12: Download-Karten festen Slots zuordnen (Lücken bleiben stehen, nichts rutscht nach)
   const progressBySlot = new Map<number, [string, DownloadProgress]>();
@@ -1785,6 +1857,7 @@ const App: React.FC = () => {
               orphans={orphans} 
               files={dbRef.current.files}
               skipped={Object.values(skippedPhotos).sort((a, b) => b.detectedAt - a.detectedAt)}
+              onlineMissing={onlineMissing}
               onClose={() => setShowCorrectionModal(false)}
               onDeleteOrphans={executeDeleteOrphans}
               onResetOrphans={executeResetOrphans}
@@ -1795,6 +1868,8 @@ const App: React.FC = () => {
               onOpenSkipped={handleOpenMissingPhoto}
               onIgnoreSkipped={handleIgnoreSkipped}
               onIgnoreAllSkipped={handleIgnoreAllSkipped}
+              onResetOnlineMissing={executeResetOnlineMissing}
+              onDeleteAllOnlineMissing={executeDeleteAllOnlineMissing}
           />
       )}
 
@@ -1888,7 +1963,7 @@ const App: React.FC = () => {
                     className="bg-red-700 hover:bg-red-600 text-white font-bold px-2 py-2 rounded text-xs border border-red-500 shadow-lg animate-pulse mb-1 flex items-center justify-between"
                  >
                      <span>🛠️ Korrekturen</span>
-                     <span className="bg-white/20 px-1.5 rounded text-[10px]">{orphans.length + corruptFilesCount + skippedCount}</span>
+                     <span className="bg-white/20 px-1.5 rounded text-[10px]">{orphans.length + corruptFilesCount + skippedCount + onlineMissingCount}</span>
                  </button>
             )}
 

@@ -6,6 +6,7 @@ interface CorrectionModalProps {
     orphans: { id: string, entry: DatabaseEntry }[];
     files: Record<string, DatabaseEntry>;
     skipped: SkippedDownload[]; // F10: Fotos mit Download-Start-Timeout
+    onlineMissing: { id: string, entry: DatabaseEntry }[]; // F13: lokal vorhanden, online nicht gesehen
     initialTab?: 'missing' | 'corrupt'; // Kept for API compatibility, but unused
     onClose: () => void;
     
@@ -23,13 +24,18 @@ interface CorrectionModalProps {
     onOpenSkipped: (id: string) => void; // Im Webview öffnen (Re-Download via "⬇ 1")
     onIgnoreSkipped: (id: string) => void; // Einzelnen Eintrag entfernen
     onIgnoreAllSkipped: () => void; // Alle Einträge entfernen
+
+    // F13: OnlineMissing Actions
+    onResetOnlineMissing: () => void; // Status zurücksetzen (Dateien behalten)
+    onDeleteAllOnlineMissing: () => void; // Alle lokal + DB entfernen
 }
 
 export const CorrectionModal: React.FC<CorrectionModalProps> = ({ 
-    orphans, files, skipped, onClose, 
+    orphans, files, skipped, onlineMissing, onClose, 
     onDeleteOrphans, onResetOrphans, onNavigate,
     onDeleteCorrupt, onDeleteAllCorrupt,
-    onOpenSkipped, onIgnoreSkipped, onIgnoreAllSkipped
+    onOpenSkipped, onIgnoreSkipped, onIgnoreAllSkipped,
+    onResetOnlineMissing, onDeleteAllOnlineMissing
 }) => {
     
     // Live-Berechnung der defekten Dateien
@@ -242,7 +248,66 @@ export const CorrectionModal: React.FC<CorrectionModalProps> = ({
                         </div>
                     )}
 
-                    {orphans.length === 0 && corruptFiles.length === 0 && skipped.length === 0 && (
+                    {/* --- SECTION 4: ONLINE MISSING (F13) --- */}
+                    {onlineMissing.length > 0 && (
+                        <div className="flex flex-col gap-2">
+                            <div className="flex justify-between items-center pb-2 border-b border-slate-700">
+                                <h4 className="text-lg font-bold text-violet-400">🌐 Online nicht gefunden ({onlineMissing.length})</h4>
+                                <div className="text-xs text-slate-400">Datei lokal vorhanden, im Scan nicht gesehen</div>
+                            </div>
+                            <div className="bg-violet-900/10 border border-violet-900/30 p-3 rounded text-xs text-slate-300">
+                                Diese Dateien liegen lokal vor, wurden im vollständigen Scan-Tag aber nicht online gefunden (evtl. auf Google gelöscht oder eine Scan-Lücke). Öffne sie im Webview zur Prüfung, behalte sie (Status zurücksetzen) oder lösche sie lokal inklusive DB-Eintrag.
+                            </div>
+                            <div className="border border-slate-700 rounded bg-slate-900/30 max-h-[300px] overflow-y-auto">
+                                <table className="w-full text-left text-xs text-slate-300">
+                                    <thead className="bg-slate-800 text-slate-400 uppercase font-bold sticky top-0">
+                                        <tr>
+                                            <th className="p-2">Erkannt am</th>
+                                            <th className="p-2">Dateiname</th>
+                                            <th className="p-2">Datum (DB)</th>
+                                            <th className="p-2 text-right">Aktion</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {onlineMissing.map((item, idx) => (
+                                            <tr key={idx} className="border-b border-slate-700 hover:bg-slate-800/50">
+                                                <td className="p-2 text-violet-400 whitespace-nowrap">
+                                                    {item.entry.onlineMissingSince ? new Date(item.entry.onlineMissingSince).toLocaleString() : 'Unbekannt'}
+                                                </td>
+                                                <td className="p-2 font-mono text-white break-all">{item.entry.filename}</td>
+                                                <td className="p-2 text-slate-500">{new Date(item.entry.timestamp).toLocaleDateString()}</td>
+                                                <td className="p-2 text-right">
+                                                    <button 
+                                                        onClick={() => onNavigate(item.id)}
+                                                        className="bg-blue-700 hover:bg-blue-600 text-white px-3 py-1 rounded text-[10px] font-bold"
+                                                        title="Im Browser öffnen zur Prüfung"
+                                                    >
+                                                        🌐 Web öffnen
+                                                    </button>
+                                                </td>
+                                            </tr>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                            <div className="flex justify-end gap-3 mt-1">
+                                <button 
+                                    onClick={onResetOnlineMissing}
+                                    className="bg-slate-700 hover:bg-slate-600 text-white px-4 py-2 rounded text-sm border border-slate-600"
+                                >
+                                    Status zurücksetzen (Behalten)
+                                </button>
+                                <button 
+                                    onClick={onDeleteAllOnlineMissing}
+                                    className="bg-violet-800 hover:bg-violet-700 text-white px-4 py-2 rounded text-sm font-bold shadow border border-violet-600"
+                                >
+                                    Alle {onlineMissing.length} lokal löschen
+                                </button>
+                            </div>
+                        </div>
+                    )}
+
+                    {orphans.length === 0 && corruptFiles.length === 0 && skipped.length === 0 && onlineMissing.length === 0 && (
                         <div className="flex flex-col items-center justify-center h-40 text-slate-500 opacity-50">
                             <div className="text-4xl mb-2">✨</div>
                             <div>Alles sauber. Keine Probleme gefunden.</div>

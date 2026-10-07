@@ -267,7 +267,7 @@ Schreibt `YYYY:MM:DD HH:MM:SS` in:
 - **Vermisste Dateien (Orphans):** aus DB löschen (Cleanup) oder „Status zurücksetzen“ (ignorieren) oder „🌐 Web öffnen“ (`https://photos.google.com/photo/<id>` im Webview → Nutzer kann manuell neu herunterladen; Modal schließt).
 - **Defekte Dateien:** „Löschen“ entfernt die Datei **physisch**, der DB-Eintrag bleibt bewusst bestehen (ohne `integrityStatus`/`hash`) → beim nächsten Backup wird sie neu geladen. „Alle von Festplatte löschen“ als Batch.
 - **Übersprungene Downloads (F10):** Fotos mit Start-Timeout (kein `files`-Eintrag; Key = Google-ID). „🌐 Web öffnen“ lädt `https://photos.google.com/photo/<id>` im Webview (Modal schließt; danach „⬇ 1“ ohne Zeitlimit), „✖ Ignorieren“/„Alle ignorieren“ entfernt den Eintrag aus `skippedDownloads` (DB-Save).
-- **`onlineMissingSince`** (F2) wird derzeit nur im Log/DB geführt; Anzeige im Modal folgt in der UI-Phase.
+- **Online nicht gefunden (F13/F2):** Sektion „🌐 Online nicht gefunden“ im Korrektur-Modal (Datei lokal vorhanden, im vollständigen Scan-Tag online nicht gesehen; Einträge mit `missingSince` laufen in der Orphan-Sektion). Pro Zeile „🌐 Web öffnen“; Batch „Status zurücksetzen (Behalten)“ (löscht `onlineMissingSince`) und „Alle lokal löschen“ (Datei physisch + DB-Eintrag, nur bei erfolgreichem `deleteFile`; F7-Muster).
 
 ### 8.4 Namensbereinigung (IPC `find-renamable-files` / „✨ Dateinamen bereinigen“)
 - Kandidaten sind Dateien mit Muster `Name (n).ext`, bei denen:
@@ -333,7 +333,7 @@ Google Photos aktualisiert das Info-Sidepanel asynchron verzögert beim Navigier
   - Vorgänger-Datum (EXIF oder Web) bzw. `filename` vergleichen: Match innerhalb 60 s oder gleicher Name.
   - Zusätzlich `matchesOwn` gegen `entry.timestamp`, wenn kein EXIF-Datum vorliegt.
   - Unvollständige Vorgänger-Referenz → **`trusted=true`** statt untrusted (verhindert die frühere Untrusted-Kaskade).
-- Debug-Log pro Foto: `Trust: refreshed=… synced=… reason=… id=…` (Typ `debug`, nur Konsole/Logdatei).
+- Debug-Log **nur bei Auffälligkeiten** (F14): `Trust: refreshed=… synced=… reason=… id=…` (Typ `debug`, nur Konsole/Logdatei) wird geloggt, wenn `!trusted`, `reason != ''` oder der Panel-Refresh nicht bestätigt ist (nicht beim ersten Foto). Normale Fotos erzeugen keine Zeile. Vollprotokoll für Diagnose: `VERBOSE_TRUST_LOG = true` (Modul-Konstante in App.tsx).
 
 ### 9.3 Konsequenzen bei `trusted=false`
 
@@ -396,7 +396,7 @@ Alle Kanalnamen exakt so (main.cjs `ipcMain`):
   - Download-Fortschrittsbalken (links oben, bis 5 gleichzeitig). **F11:** Während des Wartens auf `download-started` zeigt dieselbe Karte (stabiler Key `job:<id>`) „Warte auf Download…“, einen Sekunden-Timer und klein „max. 45 s“ (bzw. „ohne Limit“ beim Einzeldownload); beim Start wechselt sie in-place zum Fortschritt (kein Positionssprung, konstante Kartenhöhe durch reservierte Fußzeile). **F12:** feste Slots 1–5 (`slot` am Progress-Eintrag, oberster freier Slot); fertige Downloads hinterlassen unsichtbare Lücken, Karten rutschen nicht nach.
   - „Turbo Backup“-Panel (rechts oben): `processedCount`, aktive Downloads x/5, Batch x/1000.
 - **Untere Leiste (h-64):**
-  - Links: Status, Scan-Historie-Button, Duplikat-Warnung, „Datenbank prüfen“, „Dateinamen bereinigen“, „Korrekturen“ (rot, wenn Orphans/Corrupt/Übersprungene), CSV-Export, Reset, Logout, Start/Stop, „⬇ 1“.
+  - Links: Status, Scan-Historie-Button, Duplikat-Warnung, „Datenbank prüfen“, „Dateinamen bereinigen“, „Korrekturen“ (rot, wenn Orphans/Corrupt/Übersprungene/OnlineMissing), CSV-Export, Reset, Logout, Start/Stop, „⬇ 1“.
   - Mitte: Log-Fenster (nur relevante Meldungen, max. 300 Einträge, Button „Logs“ öffnet Ordner).
   - Rechts: Liste „Neue Dateien“ (max. letzte 100, Web vs. Original-Datum, ✔/⚠).
 - **Log-Filterung** (`addLog`): Alles geht an Konsole/Logdatei, aber die UI zeigt nur `error/success/warning/album` sowie Meldungen mit Schlüsselwörtern (Backup, Datenbank, Bereinigung, Status, Web, Bereits, Bekannt, vermisst, Warte, Umbenannt, Verschoben, Metadaten, Tageswechsel, Batch, Scan-Log). Debug nur Konsole.
