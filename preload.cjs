@@ -53,6 +53,7 @@ contextBridge.exposeInMainWorld('electron', {
   checkFileExists: (config) => ipcRenderer.invoke('check-file-exists', config),
   computeFileHash: (config) => ipcRenderer.invoke('compute-file-hash', config),
   showItemInFolder: (fullPath) => ipcRenderer.invoke('show-item-in-folder', fullPath),
+  openFile: (fullPath) => ipcRenderer.invoke('open-file', fullPath), // F16
   
   moveAndUpdateFile: (config) => ipcRenderer.invoke('move-and-update-file', config)
 });

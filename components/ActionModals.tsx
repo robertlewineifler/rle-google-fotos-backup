@@ -13,7 +13,8 @@ interface CorrectionModalProps {
     // Orphan Actions
     onDeleteOrphans: () => void; // Batch delete missing from DB
     onResetOrphans: () => void;
-    onShowInFolder: (orphan: { id: string, entry: DatabaseEntry }) => void; // Unused but kept for interface compat if needed
+    onShowInFolder: (item: { id: string, entry: DatabaseEntry }) => void; // F16: im Windows Explorer anzeigen
+    onOpenFile: (entry: DatabaseEntry) => void; // F16: im Standard-Viewer öffnen
     onNavigate: (id: string) => void; // Navigate to Web
 
     // Corrupt Actions
@@ -32,7 +33,7 @@ interface CorrectionModalProps {
 
 export const CorrectionModal: React.FC<CorrectionModalProps> = ({ 
     orphans, files, skipped, onlineMissing, onClose, 
-    onDeleteOrphans, onResetOrphans, onNavigate,
+    onDeleteOrphans, onResetOrphans, onNavigate, onShowInFolder, onOpenFile,
     onDeleteCorrupt, onDeleteAllCorrupt,
     onOpenSkipped, onIgnoreSkipped, onIgnoreAllSkipped,
     onResetOnlineMissing, onDeleteAllOnlineMissing
@@ -154,6 +155,20 @@ export const CorrectionModal: React.FC<CorrectionModalProps> = ({
                                                 <td className="p-2">{new Date(item.entry.timestamp).toLocaleDateString()}</td>
                                                 <td className="p-2 text-right flex justify-end gap-2">
                                                     <button 
+                                                        onClick={() => onShowInFolder(item)}
+                                                        className="bg-slate-600 hover:bg-slate-500 text-white px-2 py-1 rounded text-[10px]"
+                                                        title="Im Windows Explorer anzeigen"
+                                                    >
+                                                        📂 Explorer
+                                                    </button>
+                                                    <button 
+                                                        onClick={() => onOpenFile(item.entry)}
+                                                        className="bg-emerald-700 hover:bg-emerald-600 text-white px-2 py-1 rounded text-[10px]"
+                                                        title="Im Standard-Viewer öffnen"
+                                                    >
+                                                        🖼️ Anzeigen
+                                                    </button>
+                                                    <button 
                                                         onClick={() => onNavigate(item.id)}
                                                         className="bg-blue-700 hover:bg-blue-600 text-white px-2 py-1 rounded text-[10px]"
                                                         title="Im Browser öffnen"
@@ -256,7 +271,7 @@ export const CorrectionModal: React.FC<CorrectionModalProps> = ({
                                 <div className="text-xs text-slate-400">Datei lokal vorhanden, im Scan nicht gesehen</div>
                             </div>
                             <div className="bg-violet-900/10 border border-violet-900/30 p-3 rounded text-xs text-slate-300">
-                                Diese Dateien liegen lokal vor, wurden im vollständigen Scan-Tag aber nicht online gefunden (evtl. auf Google gelöscht oder eine Scan-Lücke). Öffne sie im Webview zur Prüfung, behalte sie (Status zurücksetzen) oder lösche sie lokal inklusive DB-Eintrag.
+                                Diese Dateien liegen lokal vor, wurden im vollständigen Scan-Tag aber nicht online gefunden (evtl. auf Google gelöscht oder eine Scan-Lücke). Prüfe sie lokal im Explorer oder Standard-Viewer (funktioniert auch, wenn das Foto online nicht mehr existiert), öffne sie im Webview, behalte sie (Status zurücksetzen) oder lösche sie lokal inklusive DB-Eintrag.
                             </div>
                             <div className="border border-slate-700 rounded bg-slate-900/30 max-h-[300px] overflow-y-auto">
                                 <table className="w-full text-left text-xs text-slate-300">
@@ -276,7 +291,21 @@ export const CorrectionModal: React.FC<CorrectionModalProps> = ({
                                                 </td>
                                                 <td className="p-2 font-mono text-white break-all">{item.entry.filename}</td>
                                                 <td className="p-2 text-slate-500">{new Date(item.entry.timestamp).toLocaleDateString()}</td>
-                                                <td className="p-2 text-right">
+                                                <td className="p-2 text-right whitespace-nowrap">
+                                                    <button 
+                                                        onClick={() => onShowInFolder(item)}
+                                                        className="bg-slate-600 hover:bg-slate-500 text-white px-2 py-1 rounded text-[10px] mr-1"
+                                                        title="Im Windows Explorer anzeigen"
+                                                    >
+                                                        📂 Explorer
+                                                    </button>
+                                                    <button 
+                                                        onClick={() => onOpenFile(item.entry)}
+                                                        className="bg-emerald-700 hover:bg-emerald-600 text-white px-2 py-1 rounded text-[10px] mr-1"
+                                                        title="Im Standard-Viewer öffnen (auch offline verfügbar)"
+                                                    >
+                                                        🖼️ Anzeigen
+                                                    </button>
                                                     <button 
                                                         onClick={() => onNavigate(item.id)}
                                                         className="bg-blue-700 hover:bg-blue-600 text-white px-3 py-1 rounded text-[10px] font-bold"
@@ -439,8 +468,8 @@ export const IntegrityReportModal: React.FC<IntegrityReportModalProps> = ({
             return;
         }
         
-        // Chunk Processing (Batch)
-        const CHUNK_SIZE = 20;
+        // Chunk Processing (Batch) – F15: 100 statt 20 (weniger IPC-Roundtrips)
+        const CHUNK_SIZE = 100;
         let processed = 0;
         let foundCorrupt: {id: string, entry: DatabaseEntry}[] = [];
         const statusUpdates: Record<string, 'ok' | 'corrupt'> = {};

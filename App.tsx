@@ -16,6 +16,9 @@ const DOWNLOAD_START_TIMEOUT_MS = 45000;
 // F14: true = Trust-Zeile für jedes Foto (Diagnose). Standard: nur bei Auffälligkeiten.
 const VERBOSE_TRUST_LOG = false;
 
+// F18: Debug-Meldungen, die trotzdem im UI-Log-Fenster erscheinen (Logdatei bleibt [debug]).
+const DEBUG_UI_KEYWORDS = ['Panel-Wait-Timeout', 'Bekannt:'];
+
 const App: React.FC = () => {
   // --- UI State ---
   const [isInitialized, setIsInitialized] = useState(false);
@@ -30,9 +33,6 @@ const App: React.FC = () => {
   const [processedCount, setProcessedCount] = useState(0);
   const [downloadedFiles, setDownloadedFiles] = useState<DownloadedFile[]>([]);
   const [scannedDays, setScannedDays] = useState<Record<string, number>>({});
-  
-  // Neuer State für den Batch-Fortschritt
-  const [batchCount, setBatchCount] = useState(0);
 
   // State für mehrere parallele Downloads (Job-Key/Filename -> Progress)
   const [activeProgress, setActiveProgress] = useState<Record<string, DownloadProgress>>({});
@@ -52,6 +52,8 @@ const App: React.FC = () => {
   const pendingStartResolvers = useRef<Map<string, (started: boolean) => void>>(new Map());
   // F11: finaler Dateiname -> stabiler Job-Key (Wartekarte wird in-place zur Fortschrittskarte)
   const jobKeyByFilenameRef = useRef<Map<string, string>>(new Map());
+  // F15: Zähler für den Download-Checkpoint (ersetzt den 30-s-Autosave)
+  const downloadsSinceSaveRef = useRef(0);
   const isResettingRef = useRef(false); // NEU: Verhindert IPC nach Reset
 
   // --- Orphans, Duplicates & Missing ---
@@ -114,7 +116,7 @@ const App: React.FC = () => {
     }
     
     const isRelevantForUI = 
-        type !== 'debug' &&
+        (type !== 'debug' &&
         (type === 'error' || 
         type === 'success' || 
         type === 'warning' ||
@@ -132,8 +134,9 @@ const App: React.FC = () => {
         message.includes('Verschoben') ||
         message.includes('Metadaten') ||
         message.includes('Tageswechsel') ||
-        message.includes('Batch') ||
-        message.includes('Scan-Log'));
+        message.includes('Scan-Log'))) ||
+        // F18: ausgewählte Debug-Meldungen trotzdem im UI anzeigen
+        (type === 'debug' && DEBUG_UI_KEYWORDS.some(k => message.includes(k)));
 
     if (isRelevantForUI) {
         setLogs(prev => {
@@ -366,6 +369,11 @@ const App: React.FC = () => {
                       
                       setDownloadedFiles(prev => [...prev, entry].slice(-100));
                       
+                      // F17: Flags vor dem Überschreiben merken (Listen-Refresh nach Wiederherstellung)
+                      const prevEntry = dbRef.current.files[result.id];
+                      const wasMissing = !!prevEntry?.missingSince;
+                      const wasOnlineMissing = !!prevEntry?.onlineMissingSince;
+
                       // DB UPDATE: Jetzt mit originalName
                       dbRef.current.files[result.id] = {
                           filename: result.filename, 
@@ -382,6 +390,10 @@ const App: React.FC = () => {
                       };
 
                       setProcessedCount(prev => prev + 1);
+                      downloadsSinceSaveRef.current += 1; // F15: Download-Checkpoint
+                      // F17: UI-Listen sofort bereinigen (Datei ist wieder da)
+                      if (wasMissing) updateOrphansList();
+                      if (wasOnlineMissing) updateOnlineMissingList();
                       addLog(`Download fertig: ${result.filename}`, 'success');
                   }
 
@@ -608,6 +620,7 @@ const App: React.FC = () => {
       }
 
       // WICHTIG: Die gerade gefundenen Missing Files sofort als 'vermisst' markieren und zu Orphans hinzufügen
+      const missingIds = new Set(result.missing.map(m => m.id)); // F17
       if (result.missing.length > 0) {
           let newMissingCount = 0;
           result.missing.forEach(m => {
@@ -618,10 +631,23 @@ const App: React.FC = () => {
           });
           if(newMissingCount > 0) {
               addLog(`${newMissingCount} neu vermisste Dateien markiert.`, 'warning');
-              updateOrphansList(); // Aktualisiert den State für das Modal
           }
       }
-      
+
+      // F17: Selbstheilung – Einträge, die wieder auf der Platte liegen, sind nicht mehr vermisst.
+      // (check-db-integrity prüft die Existenz für ALLE Einträge, auch bei onlySubset.)
+      let clearedMissing = 0;
+      for (const [id, entry] of Object.entries(dbRef.current.files) as [string, DatabaseEntry][]) {
+          if (entry.missingSince && !missingIds.has(id)) {
+              delete entry.missingSince;
+              clearedMissing++;
+          }
+      }
+      if (clearedMissing > 0) {
+          addLog(`${clearedMissing} Vermisst-Status zurückgesetzt (Datei wieder vorhanden).`, 'success');
+      }
+
+      updateOrphansList(); // F17: Liste immer aktualisieren (auch bei 0 neuen Missing-Einträgen)
       saveDatabase();
   };
 
@@ -969,15 +995,32 @@ const App: React.FC = () => {
       }
   };
   
-  const handleShowFileInExplorer = async (orphan: { id: string, entry: DatabaseEntry }) => {
-      if (!window.electron || !exportPath) return;
-      const dateObj = new Date(orphan.entry.timestamp);
+  // F16: vollständigen Dateipfad eines DB-Eintrags ermitteln (Jahr/Monat-Ordner).
+  const getEntryFullPath = (entry: DatabaseEntry): string | null => {
+      if (!exportPath) return null;
+      const dateObj = new Date(entry.timestamp);
       const year = dateObj.getFullYear().toString();
       const month = (dateObj.getMonth() + 1).toString().padStart(2, '0');
       const isWindows = exportPath.includes('\\');
       const sep = isWindows ? '\\' : '/';
-      const fullPath = `${exportPath}${sep}${year}${sep}${month}${sep}${orphan.entry.filename}`;
+      return `${exportPath}${sep}${year}${sep}${month}${sep}${entry.filename}`;
+  };
+
+  const handleShowFileInExplorer = async (orphan: { id: string, entry: DatabaseEntry }) => {
+      if (!window.electron) return;
+      const fullPath = getEntryFullPath(orphan.entry);
+      if (!fullPath) return;
       await window.electron.showItemInFolder(fullPath);
+  };
+
+  // F16: Datei im Standard-Viewer öffnen (funktioniert auch bei online gelöschten Fotos).
+  const handleOpenFileExternally = async (entry: DatabaseEntry) => {
+      if (!window.electron) return;
+      const fullPath = getEntryFullPath(entry);
+      if (!fullPath) return;
+      const err = await window.electron.openFile(fullPath);
+      if (err) addLog(`Öffnen fehlgeschlagen (${entry.filename}): ${err}`, 'warning');
+      else addLog(`Datei geöffnet: ${entry.filename}`, 'info');
   };
 
   const resetProgramState = () => {
@@ -996,7 +1039,6 @@ const App: React.FC = () => {
       setSkippedPhotos({}); // F10
       setOnlineMissing([]); // F13
       setIntegrityResult(null);
-      setBatchCount(0);
       
       // Reset Modal States
       setShowCorrectionModal(false);
@@ -1399,7 +1441,7 @@ const App: React.FC = () => {
     isWalkingRef.current = true;
     setIsWalking(true);
     setProcessedCount(0);
-    setBatchCount(0);
+    downloadsSinceSaveRef.current = 0; // F15: Download-Checkpoint zurücksetzen
     sessionSeenIds.current = new Set();
     minDateEncountered.current = null;
     maxDateEncountered.current = null;
@@ -1469,28 +1511,10 @@ const App: React.FC = () => {
 
     let consecutiveErrors = 0;
     let currentId = await Crawler.extractIdFromUrl(webviewRef.current);
-    let lastSaveTime = Date.now();
-    let batchCounter = 0; 
     let lastDayIdentifier: string | null = null;
     let firstDayIdentifier: string | null = null;
 
     while (isWalkingRef.current) {
-        if (batchCounter >= 1000) {
-             addLog("⚠️ Batch-Limit (1000) erreicht. Sicherheits-Pause...", 'warning');
-             if (activeDownloadsRef.current > 0) {
-                 addLog(`Warte auf ${activeDownloadsRef.current} aktive Downloads...`, 'info');
-                 while(activeDownloadsRef.current > 0) {
-                     if(!isWalkingRef.current) break;
-                     await sleep(200);
-                 }
-             }
-             if (!isAlbumMode) await saveDatabase();
-             await sleep(1500);
-             batchCounter = 0;
-             setBatchCount(0);
-             addLog("✅ Daten gesichert. Setze Scan fort...", 'success');
-        }
-
         while (activeDownloadsRef.current >= 5) {
              if (!isWalkingRef.current) break; 
              await sleep(500);
@@ -1501,9 +1525,10 @@ const App: React.FC = () => {
         try {
             panelScrolledRef.current = false; // F1.1: Panel-Scroll-Retry pro Foto einmal erlauben
 
-            if (!isAlbumMode && Date.now() - lastSaveTime > 30000) {
+            // F15: Download-Checkpoint (ersetzt den zeitbasierten 30-s-Autosave)
+            if (!isAlbumMode && downloadsSinceSaveRef.current >= 25) {
                 await saveDatabase();
-                lastSaveTime = Date.now();
+                downloadsSinceSaveRef.current = 0;
             }
 
             // F1.3: Ein nicht behebbarer Desync bricht die Session ab (Flag wird post-loop ausgewertet)
@@ -1617,8 +1642,6 @@ const App: React.FC = () => {
                     
                     addLog(`📅 Scan-Log: ${lastDayIdentifier} erledigt.`, 'success');
                     await saveDatabase();
-                    batchCounter = 0;
-                    setBatchCount(0);
                 } else {
                     addLog(`📅 Scan-Log: ${lastDayIdentifier} übersprungen (Start-Tag unsicher).`, 'info');
                 }
@@ -1763,9 +1786,6 @@ const App: React.FC = () => {
             if (!isWalkingRef.current) break;
 
             const navigated = await navigateAndVerifyChange(currentId);
-            
-            batchCounter++;
-            setBatchCount(batchCounter); 
 
             if (!navigated) { break; } 
             else currentId = await Crawler.extractIdFromUrl(webviewRef.current); 
@@ -1870,6 +1890,7 @@ const App: React.FC = () => {
               onIgnoreAllSkipped={handleIgnoreAllSkipped}
               onResetOnlineMissing={executeResetOnlineMissing}
               onDeleteAllOnlineMissing={executeDeleteAllOnlineMissing}
+              onOpenFile={handleOpenFileExternally}
           />
       )}
 
@@ -1934,7 +1955,6 @@ const App: React.FC = () => {
                 <div className="flex items-center gap-3"><div className="animate-spin rounded-full h-4 w-4 border-t-2 border-white"></div><div className="font-bold">Turbo Backup</div></div>
                 <div className="text-sm mt-1 text-slate-300">Neu gefunden: {processedCount}</div>
                 <div className="text-xs text-slate-400 mt-1">Aktive Downloads: {activeDownloadsCount} / 5</div>
-                <div className="text-xs text-blue-300 mt-2 border-t border-slate-600 pt-1 flex justify-between"><span>Batch:</span> <span className="font-mono">{batchCount} / 1000</span></div>
             </div>
         )}
       </div>
@@ -1994,6 +2014,7 @@ const App: React.FC = () => {
                         l.type === 'success' ? 'bg-green-900/30 text-green-300' : 
                         l.type === 'warning' ? 'bg-amber-900/30 text-amber-300' : 
                         l.type === 'album' ? 'bg-purple-900/30 text-purple-300 border-l-2 border-purple-500' : 
+                        l.type === 'debug' ? 'text-slate-400 italic' :
                         'text-slate-300'
                     }`}>
                         <span className="opacity-50 mr-2">{new Date(l.timestamp).toLocaleTimeString()}</span>{l.message}

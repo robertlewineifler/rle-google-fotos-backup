@@ -819,6 +819,13 @@ ipcMain.handle('show-item-in-folder', async (event, fullPath) => {
     if (fullPath) shell.showItemInFolder(fullPath);
 });
 
+// F16: Datei im Standardprogramm öffnen (Bild/Video). Rückgabe: Fehlerstring ("" = Erfolg).
+ipcMain.handle('open-file', async (event, fullPath) => {
+    if (!fullPath) return 'Kein Pfad';
+    if (!fs.existsSync(fullPath)) return 'Datei nicht gefunden';
+    return await shell.openPath(fullPath);
+});
+
 // --- METADATA & FILE UTILS ---
 
 function getFileHash(filePath) {

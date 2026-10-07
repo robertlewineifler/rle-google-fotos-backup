@@ -178,6 +178,7 @@ declare global {
       }) => Promise<{ success: boolean, newFilename?: string, newHash?: string, actualHash?: string, error?: string }>;
 
       showItemInFolder: (fullPath: string) => Promise<void>;
+      openFile: (fullPath: string) => Promise<string>; // F16: Standard-Viewer; "" = Erfolg
     };
   }
 }
