@@ -1,12 +1,12 @@
 
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { ProcessingLog, DownloadedFile, DownloadResult, FileDatabase, DatabaseEntry, IntegrityResult, DownloadProgress, RenamableFile, SkippedDownload, UntrackedFile } from './types';
+import { ProcessingLog, DownloadedFile, DownloadResult, FileDatabase, DatabaseEntry, IntegrityResult, DownloadProgress, SkippedDownload, UntrackedFile } from './types';
 import { parseGoogleDateString, parseExifDateToDate, getIsoDateString } from './utils/exifUtils';
 import * as Crawler from './logic/crawlerActions';
 import * as DbUtils from './logic/databaseUtils';
 import { StartupScreen } from './components/StartupScreen';
-import { IntegrityReportModal, CorrectionModal, RenameModal, AlbumDownloadModal } from './components/ActionModals';
+import { CorrectionModal, AlbumDownloadModal } from './components/ActionModals';
 import { ScanHeatmapModal } from './components/ScanHeatmap';
 
 // F10: Google braucht bei großen Videos teils >30 s bis will-download feuert.
@@ -29,7 +29,6 @@ const App: React.FC = () => {
   const dbFilePathRef = useRef<string | null>(null);
   
   const [isWalking, setIsWalking] = useState(false);
-  const [isChecking, setIsChecking] = useState(false); // NEU: Lade-Status für Checks
   const [processedCount, setProcessedCount] = useState(0);
   const [downloadedFiles, setDownloadedFiles] = useState<DownloadedFile[]>([]);
   const [scannedDays, setScannedDays] = useState<Record<string, number>>({});
@@ -61,15 +60,12 @@ const App: React.FC = () => {
   const [skippedPhotos, setSkippedPhotos] = useState<Record<string, SkippedDownload>>({}); // F10
   const [onlineMissing, setOnlineMissing] = useState<{id: string, entry: DatabaseEntry}[]>([]); // F13
   const [integrityResult, setIntegrityResult] = useState<IntegrityResult | null>(null);
-  const [renamableFiles, setRenamableFiles] = useState<RenamableFile[]>([]); // NEU
-  
+
   // CORRECTIONS & MODALS STATE
   const [showCorrectionModal, setShowCorrectionModal] = useState(false);
   // correctionTab removed as per request (now combined view)
   
-  const [showIntegrityModal, setShowIntegrityModal] = useState(false);
   const [showHeatmapModal, setShowHeatmapModal] = useState(false);
-  const [showRenameModal, setShowRenameModal] = useState(false); // NEU
   const [showAlbumModal, setShowAlbumModal] = useState(false);
 
   // --- Refs ---
@@ -104,7 +100,7 @@ const App: React.FC = () => {
   const corruptFilesCount = useMemo(() => {
       if (!isInitialized) return 0;
       return (Object.values(dbRef.current.files) as DatabaseEntry[]).filter(f => f.integrityStatus === 'corrupt').length;
-  }, [processedCount, isInitialized, showIntegrityModal]); // Recalc on updates
+  }, [processedCount, isInitialized]); // Recalc on updates
 
   // --- Helper Functions ---
   const addLog = (message: string, type: 'info' | 'error' | 'success' | 'debug' | 'warning' | 'album' = 'info') => {
@@ -588,17 +584,8 @@ const App: React.FC = () => {
 
   // --- INTEGRITY & CHECKS ---
   
-  // Geändert: Führt nicht sofort Logik aus, sondern öffnet das Menü.
-  // Das Modal selbst triggert dann die Logik.
-  const openIntegrityMenu = () => {
-      setIntegrityResult(null); // Reset result
-      setShowIntegrityModal(true);
-  };
-  
-  // Callback: Wird vom Modal aufgerufen, wenn Struktur-Check fertig ist
-  const handleIntegrityCheckDone = (result: IntegrityResult) => {
-      setIntegrityResult(result);
-      
+  // Callback: Wird vom Modal (F22: Prüfung & Korrekturen) aufgerufen, wenn Struktur-Check fertig ist
+  const handleIntegrityCheckDone = async (result: IntegrityResult) => {
       // 1. Auto-Update Hashes in DB
       const updateKeys = Object.keys(result.updates);
       if (updateKeys.length > 0) {
@@ -647,6 +634,114 @@ const App: React.FC = () => {
           addLog(`${clearedMissing} Vermisst-Status zurückgesetzt (Datei wieder vorhanden).`, 'success');
       }
 
+      // F23: Automatische Auflösung hash-identischer "(n)"-Paare (keine Buttons nötig)
+      let autoRenamedTotal = 0;   // F26: Zähler für den Info-Banner
+      let autoResolvedTotal = 0;  // F26: Duplikate + Kollisionsreste
+      if (result.untracked && result.untracked.length > 0 && exportPath) {
+          const remaining: UntrackedFile[] = [];
+          for (const file of result.untracked) {
+              try {
+                  const hasSuffix = /\(\d+\)/.test(file.filename);
+
+                  if (file.trackedDuplicate) {
+                      // Inverser Fall: DB zeigt auf "Name (n).ext", Basisdatei liegt untracked vor
+                      const td = file.trackedDuplicate;
+                      const entry = dbRef.current.files[td.id];
+                      if (entry && file.hash && entry.hash && file.hash === entry.hash) {
+                          entry.filename = file.filename;
+                          await saveDatabase(); // erst DB umstellen, dann löschen
+                          const deleted = await window.electron.deleteFile({ basePath: exportPath, filename: td.filename, timestamp: entry.timestamp });
+                          addLog(deleted
+                              ? `Duplikat automatisch aufgelöst: DB → ${file.filename}, "${td.filename}" gelöscht.`
+                              : `DB auf ${file.filename} umgestellt, aber "${td.filename}" konnte nicht gelöscht werden.`,
+                              deleted ? 'success' : 'warning');
+                          if (deleted) { autoResolvedTotal++; continue; }
+                          remaining.push(file);
+                      } else {
+                          remaining.push(file);
+                      }
+                  } else if (file.duplicateOf && hasSuffix && file.hash) {
+                      // Normaler Fall: untracked "(n)"-Datei mit identischem Inhalt -> löschen
+                      const ts = new Date(Number(file.year), Number(file.month) - 1, 1).getTime();
+                      const deleted = await window.electron.deleteFile({ basePath: exportPath, filename: file.filename, timestamp: ts });
+                      addLog(deleted
+                          ? `Kollisionsrest automatisch gelöscht: ${file.filename} (Duplikat von ${file.duplicateOf}).`
+                          : `Kollisionsrest konnte nicht gelöscht werden: ${file.filename}`,
+                          deleted ? 'success' : 'warning');
+                      if (deleted) { autoResolvedTotal++; continue; }
+                      remaining.push(file);
+                  } else {
+                      remaining.push(file);
+                  }
+              } catch (e: any) {
+                  addLog(`Auto-Auflösung fehlgeschlagen (${file.filename}): ${e.message}`, 'warning');
+                  remaining.push(file);
+              }
+          }
+          result = { ...result, untracked: remaining };
+      }
+
+      // F24: Dateinamen-Prüfung automatisch ausführen + sichere Aktionen anwenden; Ergebnis für den Info-Tab
+      if (exportPath) {
+          try {
+              const renameResult = await window.electron.findRenamableFiles(exportPath, dbRef.current.files);
+
+              for (const item of (renameResult?.candidates || [])) {
+                  try {
+                      if (item.resolveDuplicate) {
+                          const entry = dbRef.current.files[item.id];
+                          if (!entry) continue;
+                          const hashRes = await window.electron.computeFileHash({ basePath: exportPath, filename: item.currentName, timestamp: item.timestamp });
+                          if (!hashRes.success || (entry.hash && hashRes.hash !== entry.hash)) {
+                              addLog(`Duplikat-Auflösung übersprungen (Hash nicht bestätigt): ${item.currentName}`, 'warning');
+                              continue;
+                          }
+                          entry.filename = item.newName;
+                          await saveDatabase(); // erst DB umstellen, dann löschen
+                          const deleted = await window.electron.deleteFile({ basePath: exportPath, filename: item.currentName, timestamp: item.timestamp });
+                          if (deleted) {
+                              autoResolvedTotal++;
+                              addLog(`Duplikat automatisch aufgelöst: DB → ${item.newName}, "${item.currentName}" gelöscht.`, 'success');
+                          } else {
+                              addLog(`DB auf ${item.newName} umgestellt, aber "${item.currentName}" konnte nicht gelöscht werden.`, 'warning');
+                          }
+                          continue;
+                      }
+
+                      const res = await window.electron.renameFile({
+                          basePath: exportPath,
+                          oldName: item.currentName,
+                          newName: item.newName,
+                          timestamp: item.timestamp,
+                          expectedHash: dbRef.current.files[item.id]?.hash
+                      });
+                      if (res.success) {
+                          if (dbRef.current.files[item.id]) dbRef.current.files[item.id].filename = item.newName;
+                          autoRenamedTotal++;
+                          addLog(`Automatisch umbenannt: ${item.currentName} → ${item.newName}`, 'success');
+                      } else {
+                          addLog(`Automatisches Umbenennen fehlgeschlagen: ${item.currentName} (${res.error || 'unbekannt'})`, 'warning');
+                      }
+                  } catch (e: any) {
+                      addLog(`Auto-Umbenennung fehlgeschlagen (${item.currentName}): ${e.message}`, 'warning');
+                  }
+              }
+
+              result = {
+                  ...result,
+                  renamable: {
+                      entries: renameResult?.entries || [],
+                      stats: renameResult?.stats,
+                      autoRenamed: autoRenamedTotal,
+                      autoResolved: autoResolvedTotal
+                  }
+              };
+          } catch (e: any) {
+              addLog(`Dateinamen-Prüfung fehlgeschlagen: ${e.message}`, 'warning');
+          }
+      }
+
+      setIntegrityResult(result);
       updateOrphansList(); // F17: Liste immer aktualisieren (auch bei 0 neuen Missing-Einträgen)
       saveDatabase();
   };
@@ -737,79 +832,6 @@ const App: React.FC = () => {
       addLog(`${deletedCount} defekte Dateien gelöscht.${failedCount > 0 ? ` ${failedCount} fehlgeschlagen (siehe Warnungen).` : ''} Bereit für Re-Download.`, failedCount > 0 ? 'warning' : 'success');
   };
   
-  // --- RENAME LOGIC ---
-  const scanForRenamableFiles = async () => {
-      if (!window.electron || !exportPath || !dbRef.current.files) return;
-      addLog("Suche nach unnötigen Nummerierungen...", 'info');
-      
-      try {
-          const result = await window.electron.findRenamableFiles(exportPath, dbRef.current.files);
-          const candidates = result?.candidates || [];
-          const s = result?.stats;
-
-          if (candidates.length > 0) {
-              setRenamableFiles(candidates);
-              setShowRenameModal(true);
-              addLog(`${candidates.length} Dateien können bereinigt werden.`, 'info');
-          } else if (s) {
-              addLog(`Bereinigung: 0 Kandidaten. ${s.nTotal} Namen mit "(n)": ${s.legitNames} originale Google-Namen (geschützt), ${s.collisionPair} Kollisions-Kopien (Basisdatei existiert), ${s.nameMismatch} ohne Namensbezug, ${s.noName} ohne Originalname, ${s.currentMissing} Datei fehlt.`, 'success');
-              const msg =
-                  `Keine sicheren Umbenennungen gefunden.\n\n` +
-                  `${s.nTotal} Dateinamen mit "(n)":\n` +
-                  `• ${s.legitNames} sind originale Google-Namen (werden geschützt)\n` +
-                  `• ${s.collisionPair} sind Kollisions-Kopien, Basisdatei existiert bereits\n` +
-                  `• ${s.nameMismatch} ohne passenden Originalnamen\n` +
-                  `• ${s.noName} ohne Originalname\n` +
-                  `• ${s.currentMissing} Datei(en) fehlen lokal\n\n` +
-                  `Inhaltsgleiche Duplikate findest du über "Datenbank prüfen" → "Duplikate lösen".\n\n` +
-                  `Duplikat-Prüfung jetzt öffnen?`;
-              if (confirm(msg)) {
-                  openIntegrityMenu();
-              }
-          } else {
-              addLog("Keine Dateien zur Bereinigung gefunden.", 'success');
-              alert("Keine Dateien gefunden, bei denen die Original-Datei fehlt UND der Original-Name sicher übereinstimmt.");
-          }
-      } catch (e: any) {
-          addLog("Fehler beim Scan: " + e.message, 'error');
-      }
-  };
-  
-  const executeRenameFiles = async () => {
-      if (!exportPath || renamableFiles.length === 0) return;
-      addLog(`Benenne ${renamableFiles.length} Dateien um...`, 'info');
-      
-      let successCount = 0;
-      for (const item of renamableFiles) {
-          try {
-              const res = await window.electron.renameFile({
-                  basePath: exportPath,
-                  oldName: item.currentName,
-                  newName: item.newName,
-                  timestamp: item.timestamp,
-                  expectedHash: dbRef.current.files[item.id]?.hash
-              });
-              
-              if (res.success) {
-                  // DB Update
-                  if (dbRef.current.files[item.id]) {
-                      dbRef.current.files[item.id].filename = item.newName;
-                  }
-                  successCount++;
-              } else {
-                  addLog(`Umbenennen fehlgeschlagen: ${item.currentName} (${res.error || 'unbekannt'})`, 'warning');
-              }
-          } catch (e) {
-              console.error(e);
-          }
-      }
-      
-      await saveDatabase();
-      setShowRenameModal(false);
-      setRenamableFiles([]);
-      addLog(`Bereinigung abgeschlossen. ${successCount} Dateien umbenannt.`, 'success');
-  };
-
   const executeCleanLegacy = async () => {
       if (!dbRef.current) return;
       if (!confirm("Veraltete Datenfelder werden aus der Datenbank-Datei entfernt. Die Dateien selbst bleiben unberührt.")) return;
@@ -913,7 +935,38 @@ const App: React.FC = () => {
       }
   };
 
-  // F13: Online-nicht-gefunden-Dateien lokal löschen (Datei + DB-Eintrag; F7-Muster).
+  // F13/F27: Einen OnlineMissing-Eintrag lokal löschen (Datei + DB-Eintrag; F7-Muster).
+  const deleteOnlineMissingEntry = async (item: { id: string, entry: DatabaseEntry }): Promise<boolean> => {
+      if (!window.electron || !exportPath) return false;
+      try {
+          const deleted = await window.electron.deleteFile({
+              basePath: exportPath,
+              filename: item.entry.filename,
+              timestamp: item.entry.timestamp
+          });
+          if (!deleted) {
+              addLog(`Löschen fehlgeschlagen (DB unverändert): ${item.entry.filename}`, 'warning');
+              return false;
+          }
+          delete dbRef.current.files[item.id];
+          processedIdsRef.current.delete(item.id);
+          return true;
+      } catch (e) { console.error(e); return false; }
+  };
+
+  // F27: Einzelnen OnlineMissing-Eintrag löschen
+  const handleDeleteOnlineMissing = async (id: string) => {
+      const item = onlineMissing.find(o => o.id === id);
+      if (!item) return;
+      const ok = await deleteOnlineMissingEntry(item);
+      if (ok) {
+          await saveDatabase();
+          updateOnlineMissingList();
+          addLog(`Lokal gelöscht (online nicht gefunden): ${item.entry.filename}`, 'success');
+      }
+  };
+
+  // F13: Alle Online-nicht-gefunden-Dateien lokal löschen (Datei + DB-Eintrag; F7-Muster).
   const executeDeleteAllOnlineMissing = async () => {
       if (!exportPath || onlineMissing.length === 0) return;
       if (!confirm(`Wirklich alle ${onlineMissing.length} Dateien von der Festplatte löschen und aus der DB entfernen?`)) return;
@@ -922,21 +975,9 @@ const App: React.FC = () => {
       let deletedCount = 0;
       let failedCount = 0;
       for (const item of onlineMissing) {
-          try {
-              const deleted = await window.electron.deleteFile({
-                  basePath: exportPath,
-                  filename: item.entry.filename,
-                  timestamp: item.entry.timestamp
-              });
-              if (!deleted) {
-                  failedCount++;
-                  addLog(`Löschen fehlgeschlagen (DB unverändert): ${item.entry.filename}`, 'warning');
-                  continue;
-              }
-              delete dbRef.current.files[item.id];
-              processedIdsRef.current.delete(item.id);
-              deletedCount++;
-          } catch (e) { console.error(e); failedCount++; }
+          const ok = await deleteOnlineMissingEntry(item);
+          if (ok) deletedCount++;
+          else failedCount++;
       }
       await saveDatabase();
       updateOnlineMissingList();
@@ -973,7 +1014,6 @@ const App: React.FC = () => {
           }
           await saveDatabase();
           setIntegrityResult(prev => prev ? ({...prev, duplicates: []}) : null);
-          setShowIntegrityModal(false);
           addLog(`Duplikat-Bereinigung fertig. ${count} gelöscht.${skippedOnlineGroups > 0 ? ` ${skippedOnlineGroups} Gruppen übersprungen (alle Einträge noch online).` : ''}`, 'success');
       } catch (e: any) {
           addLog("Fehler bei Duplikat-Lösung: " + e.message, 'error');
@@ -1028,8 +1068,13 @@ const App: React.FC = () => {
       if (!window.electron || !exportPath) return false;
       const ts = new Date(Number(file.year), Number(file.month) - 1, 1).getTime();
       const deleted = await window.electron.deleteFile({ basePath: exportPath, filename: file.filename, timestamp: ts });
-      if (deleted) addLog(`Verwaiste Datei gelöscht: ${file.filename} (${file.year}/${file.month})`, 'success');
-      else addLog(`Löschen fehlgeschlagen (verwaiste Datei): ${file.filename}`, 'warning');
+      if (deleted) {
+          addLog(`Verwaiste Datei gelöscht: ${file.filename} (${file.year}/${file.month})`, 'success');
+          // F22: Ergebnis-Liste im App-State mitführen, damit gelöschte Einträge nicht wieder auftauchen
+          setIntegrityResult(prev => prev ? { ...prev, untracked: (prev.untracked || []).filter(f => f.path !== file.path) } : prev);
+      } else {
+          addLog(`Löschen fehlgeschlagen (verwaiste Datei): ${file.filename}`, 'warning');
+      }
       return deleted;
   };
 
@@ -1062,10 +1107,7 @@ const App: React.FC = () => {
       
       // Reset Modal States
       setShowCorrectionModal(false);
-      setShowIntegrityModal(false);
-      setShowRenameModal(false); 
       setShowAlbumModal(false);
-      setRenamableFiles([]); 
       
       // 3. Clear Refs
       dbRef.current = { basePath: '', lastUpdated: 0, files: {}, scannedDays: {}, skippedDownloads: {}, hashScheme: 2 };
@@ -1857,7 +1899,9 @@ const App: React.FC = () => {
   const duplicateCount = integrityResult?.duplicates?.length || 0;
   const skippedCount = Object.keys(skippedPhotos).length; // F10
   const onlineMissingCount = onlineMissing.length; // F13
-  const hasCorrections = orphans.length > 0 || corruptFilesCount > 0 || skippedCount > 0 || onlineMissingCount > 0;
+  const untrackedCount = integrityResult?.untracked?.length || 0; // F21/F22
+  const correctionCount = orphans.length + corruptFilesCount + skippedCount + onlineMissingCount + untrackedCount;
+  const hasCorrections = correctionCount > 0 || duplicateCount > 0;
 
   // F12: Download-Karten festen Slots zuordnen (Lücken bleiben stehen, nichts rutscht nach)
   const progressBySlot = new Map<number, [string, DownloadProgress]>();
@@ -1891,21 +1935,14 @@ const App: React.FC = () => {
 
   return (
     <div className="flex flex-col h-screen bg-slate-900 text-slate-100 overflow-hidden relative">
-      {/* LOADING OVERLAY */}
-      {isChecking && (
-          <div className="fixed inset-0 bg-black/70 z-[100] flex flex-col items-center justify-center backdrop-blur-sm">
-               <div className="animate-spin rounded-full h-16 w-16 border-t-4 border-blue-500 mb-4"></div>
-               <div className="text-xl font-bold text-white">Datenbank wird geprüft...</div>
-               <div className="text-sm text-slate-400 mt-2">Dies kann bei großen Sammlungen einen Moment dauern.</div>
-          </div>
-      )}
-
       {showCorrectionModal && (
           <CorrectionModal 
               orphans={orphans} 
               files={dbRef.current.files}
               skipped={Object.values(skippedPhotos).sort((a, b) => b.detectedAt - a.detectedAt)}
               onlineMissing={onlineMissing}
+              basePath={exportPath || ""}
+              integrityResult={integrityResult}
               onClose={() => setShowCorrectionModal(false)}
               onDeleteOrphans={executeDeleteOrphans}
               onResetOrphans={executeResetOrphans}
@@ -1918,29 +1955,19 @@ const App: React.FC = () => {
               onIgnoreAllSkipped={handleIgnoreAllSkipped}
               onResetOnlineMissing={executeResetOnlineMissing}
               onDeleteAllOnlineMissing={executeDeleteAllOnlineMissing}
+              onDeleteOnlineMissing={handleDeleteOnlineMissing}
               onOpenFile={handleOpenFileExternally}
+              onDeleteUntrackedFile={handleDeleteUntrackedFile}
+              onShowUntrackedInExplorer={handleShowUntrackedInExplorer}
+              onOpenUntracked={handleOpenUntracked}
+              onCheckDone={handleIntegrityCheckDone}
+              onUpdateFileStatus={handleIntegrityStatusUpdate}
+              onExecuteDuplicates={executeResolveDuplicates}
+              onCleanLegacy={executeCleanLegacy}
           />
       )}
 
-      {showIntegrityModal && ( 
-          <IntegrityReportModal 
-            initialResult={integrityResult} // Pass existing result if available
-            basePath={exportPath || ""}
-            files={dbRef.current.files} 
-            onClose={() => setShowIntegrityModal(false)} 
-            onCheckDone={handleIntegrityCheckDone}
-            onExecuteDuplicates={executeResolveDuplicates} 
-            onShowMissing={() => { setShowIntegrityModal(false); setShowCorrectionModal(true); }} 
-            onCleanLegacy={executeCleanLegacy}
-            onUpdateFileStatus={handleIntegrityStatusUpdate}
-            onDeleteCorruptFile={handleRemoveCorruptFile}
-            onDeleteUntrackedFile={handleDeleteUntrackedFile}
-            onShowUntrackedInExplorer={handleShowUntrackedInExplorer}
-            onOpenUntracked={handleOpenUntracked}
-          /> 
-      )}
       {/* MISSING FILES MODAL REMOVED - now handled by CorrectionModal */}
-      {showRenameModal && <RenameModal candidates={renamableFiles} onClose={() => setShowRenameModal(false)} onExecute={executeRenameFiles} />}
       {showHeatmapModal && <ScanHeatmapModal scannedDays={scannedDays} files={dbRef.current.files} onClose={() => setShowHeatmapModal(false)} />}
       {showAlbumModal && (
           <AlbumDownloadModal
@@ -1996,20 +2023,15 @@ const App: React.FC = () => {
             
             <button onClick={() => setShowHeatmapModal(true)} className="bg-slate-700 hover:bg-slate-600 text-slate-200 px-2 py-2 rounded text-xs border border-slate-600 flex items-center justify-between mb-2"><span className="font-bold">📊 Scan-Historie</span><span className="text-[10px] bg-slate-800 px-1 rounded">{uniqueUsageDays} Aktiv-Tage</span></button>
             
-            {duplicateCount > 0 && <div className="mb-2 p-2 bg-amber-900/50 border border-amber-500 rounded text-xs animate-pulse"><div className="font-bold text-amber-200">⚠ Duplikate ({duplicateCount})</div><button onClick={() => setShowIntegrityModal(true)} className="w-full bg-amber-700 hover:bg-amber-600 text-white text-[10px] py-1 rounded mt-1">Lösen</button></div>}
-            
-            <button onClick={openIntegrityMenu} className="bg-slate-700 hover:bg-slate-600 text-slate-200 px-2 py-1 rounded text-xs border border-slate-600 mb-1">🔎 Datenbank prüfen</button>
-            <button onClick={scanForRenamableFiles} className="bg-slate-700 hover:bg-slate-600 text-slate-200 px-2 py-1 rounded text-xs border border-slate-600 mb-1">✨ Dateinamen bereinigen</button>
-            
-            {hasCorrections && (
-                 <button 
-                    onClick={() => { setShowCorrectionModal(true); }}
-                    className="bg-red-700 hover:bg-red-600 text-white font-bold px-2 py-2 rounded text-xs border border-red-500 shadow-lg animate-pulse mb-1 flex items-center justify-between"
-                 >
-                     <span>🛠️ Korrekturen</span>
-                     <span className="bg-white/20 px-1.5 rounded text-[10px]">{orphans.length + corruptFilesCount + skippedCount + onlineMissingCount}</span>
-                 </button>
-            )}
+
+            <button 
+                onClick={() => { setShowCorrectionModal(true); }}
+                className={`font-bold px-2 py-2 rounded text-xs border mb-1 flex items-center justify-between ${hasCorrections ? 'bg-red-700 hover:bg-red-600 text-white border-red-500 shadow-lg animate-pulse' : 'bg-slate-700 hover:bg-slate-600 text-slate-200 border-slate-600'}`}
+                title="Struktur-/Inhaltsprüfung, Duplikate und Korrektur-Listen"
+            >
+                <span>🛠️ Prüfung & Korrekturen</span>
+                <span className="bg-white/20 px-1.5 rounded text-[10px]">{correctionCount}{duplicateCount > 0 ? ` +${duplicateCount} Dup.` : ''}</span>
+            </button>
 
             <button onClick={handleExportCsv} className="bg-slate-700 hover:bg-slate-600 text-slate-200 px-2 py-1 rounded text-xs border border-slate-600 mb-2">📄 Excel CSV Export</button>
 

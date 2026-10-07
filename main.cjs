@@ -670,10 +670,10 @@ ipcMain.handle('check-db-integrity', async (event, { basePath, files, onlySubset
             }
 
             // Bekannte Hashes für den Duplikat-Abgleich (gespeicherter Hash oder frisch berechnet)
-            const hashToFilename = {};
+            const hashToTracked = {};
             for (const [id, entry] of entries) {
                 const h = updates[id] || entry.hash;
-                if (h && !hashToFilename[h]) hashToFilename[h] = entry.filename;
+                if (h && !hashToTracked[h]) hashToTracked[h] = { id, filename: entry.filename };
             }
 
             const yearDirs = fs.readdirSync(basePath, { withFileTypes: true })
@@ -693,6 +693,21 @@ ipcMain.handle('check-db-integrity', async (event, { basePath, files, onlySubset
                         try { size = fs.statSync(fullPath).size; } catch (e) { continue; }
                         let hash;
                         try { hash = await getFileHash(fullPath); } catch (e) { /* Hash optional */ }
+
+                        // F23: Richtung erkennen – getrackter "(n)"-Eintrag + untracked Basisdatei (gleicher Hash)
+                        const suffixRegex = /^(.*?)\s\(\d+\)(\.[^.]+)$/;
+                        const tracked = hash ? hashToTracked[hash] : undefined;
+                        let duplicateOf, trackedDuplicate;
+                        if (tracked) {
+                            const untrackedIsSuffix = suffixRegex.test(f.name);
+                            const trackedIsSuffix = suffixRegex.test(tracked.filename);
+                            if (!untrackedIsSuffix && trackedIsSuffix) {
+                                trackedDuplicate = { id: tracked.id, filename: tracked.filename };
+                            } else {
+                                duplicateOf = tracked.filename;
+                            }
+                        }
+
                         untracked.push({
                             path: fullPath,
                             filename: f.name,
@@ -700,7 +715,8 @@ ipcMain.handle('check-db-integrity', async (event, { basePath, files, onlySubset
                             month: md.name,
                             size,
                             hash,
-                            duplicateOf: hash ? hashToFilename[hash] : undefined
+                            duplicateOf,
+                            trackedDuplicate
                         });
                     }
                 }
@@ -719,6 +735,7 @@ ipcMain.handle('check-db-integrity', async (event, { basePath, files, onlySubset
 // Zielnamen passen. Echte Google-Namen wie "DB 2025 (970).JPG" werden dadurch nie angefasst.
 ipcMain.handle('find-renamable-files', async (event, { basePath, files }) => {
     const candidates = [];
+    const checkEntries = []; // F24: Einzel-Einträge für den Info-Tab
     const entries = Object.entries(files);
 
     // Regex für "Name (ZAHL).ext"
@@ -730,8 +747,9 @@ ipcMain.handle('find-renamable-files', async (event, { basePath, files }) => {
         noName: 0,           // kein originalName gespeichert
         nameMismatch: 0,     // originalName passt nicht zum Basisnamen
         currentMissing: 0,   // "(n)"-Datei liegt nicht auf der Platte
-        collisionPair: 0,    // Basisdatei existiert ebenfalls (Duplikat-Verdacht)
-        targetMissing: 0     // Basisname ist frei -> Kandidat
+        collisionPair: 0,    // Basisdatei existiert ebenfalls, Inhalt unterschiedlich
+        targetMissing: 0,    // Basisname ist frei -> Kandidat
+        resolveDuplicate: 0  // F23: Basisdatei hash-identisch -> Duplikat auflösbar
     };
 
     const fileStem = (name) => {
@@ -750,17 +768,20 @@ ipcMain.handle('find-renamable-files', async (event, { basePath, files }) => {
         // Echter Google-Name mit "(n)" -> niemals umbenennen
         if (entry.originalName && entry.originalName.toLowerCase() === entry.filename.toLowerCase()) {
             stats.legitNames++;
+            checkEntries.push({ id, currentName: entry.filename, originalName: entry.originalName, timestamp: entry.timestamp, status: 'protected' });
             continue;
         }
 
         if (!entry.originalName) {
             stats.noName++;
+            checkEntries.push({ id, currentName: entry.filename, timestamp: entry.timestamp, status: 'noName' });
             continue;
         }
 
         // Namensprüfung: Stamm ohne Endung, case-insensitiv (deckt .JPG/.jpg und HEIC->jpg ab)
         if (fileStem(entry.originalName).toLowerCase() !== fileStem(cleanName).toLowerCase()) {
             stats.nameMismatch++;
+            checkEntries.push({ id, currentName: entry.filename, originalName: entry.originalName, timestamp: entry.timestamp, status: 'nameMismatch' });
             continue;
         }
 
@@ -775,15 +796,39 @@ ipcMain.handle('find-renamable-files', async (event, { basePath, files }) => {
         // Check 1: Existiert die "(n)"-Datei überhaupt?
         if (!fs.existsSync(currentPath)) {
             stats.currentMissing++;
+            checkEntries.push({ id, currentName: entry.filename, originalName: entry.originalName, timestamp: entry.timestamp, status: 'missing' });
             continue;
         }
 
-        // Check 2: Basisdatei existiert bereits -> Duplikat-Verdacht, kein Rename
+        // Check 2: Basisdatei existiert bereits -> nur auflösen, wenn Inhalt identisch (F23)
         if (fs.existsSync(targetPath)) {
-            stats.collisionPair++;
+            let identical = false;
+            try {
+                const h1 = await getFileHash(currentPath);
+                const h2 = await getFileHash(targetPath);
+                identical = h1 === h2;
+            } catch (e) { /* Hash-Fehler -> als echte Kollision behandeln */ }
+
+            if (!identical) {
+                stats.collisionPair++;
+                checkEntries.push({ id, currentName: entry.filename, newName: cleanName, originalName: entry.originalName, timestamp: entry.timestamp, status: 'collision' });
+                continue;
+            }
+
+            stats.resolveDuplicate++;
+            checkEntries.push({ id, currentName: entry.filename, newName: cleanName, originalName: entry.originalName, timestamp: entry.timestamp, status: 'resolveDuplicate' });
+            candidates.push({
+                id,
+                currentName: entry.filename,
+                newName: cleanName,
+                timestamp: entry.timestamp,
+                path: path.join(year, month),
+                resolveDuplicate: true
+            });
             continue;
         }
         stats.targetMissing++;
+        checkEntries.push({ id, currentName: entry.filename, newName: cleanName, originalName: entry.originalName, timestamp: entry.timestamp, status: 'renamable' });
 
         candidates.push({
             id,
@@ -794,7 +839,7 @@ ipcMain.handle('find-renamable-files', async (event, { basePath, files }) => {
         });
     }
 
-    return { candidates, stats };
+    return { candidates, stats, entries: checkEntries };
 });
 
 ipcMain.handle('rename-file', async (event, { basePath, oldName, newName, timestamp, expectedHash }) => {

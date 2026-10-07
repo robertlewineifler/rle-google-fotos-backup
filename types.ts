@@ -117,6 +117,8 @@ export interface UntrackedFile {
     size: number;
     hash?: string;
     duplicateOf?: string; // Dateiname eines getrackten Fotos mit identischem Hash
+    // F23: Basisdatei (ohne "(n)"), während der getrackte Eintrag ein "(n)"-Duplikat ist
+    trackedDuplicate?: { id: string; filename: string };
 }
 
 export interface IntegrityResult {
@@ -128,6 +130,12 @@ export interface IntegrityResult {
     sizeUpdates?: Record<string, number>; // NEU: ID -> Dateigröße in Bytes
     legacyCount?: number; // NEU: Anzahl veralteter Einträge
     untracked?: UntrackedFile[]; // F21: verwaiste Dateien auf der Platte
+    renamable?: { // F24: Ergebnis der Dateinamen-Prüfung (Info-Tab)
+        entries: RenameCheckEntry[];
+        stats?: RenamableStats;
+        autoRenamed?: number;
+        autoResolved?: number;
+    };
 }
 
 export interface RenamableFile {
@@ -136,6 +144,7 @@ export interface RenamableFile {
     newName: string;
     timestamp: number;
     path: string; // Relativer Pfad
+    resolveDuplicate?: boolean; // F23: Basisdatei hash-identisch -> Duplikat auflösen statt umbenennen
 }
 
 export interface RenamableStats {
@@ -144,8 +153,20 @@ export interface RenamableStats {
     noName: number;          // kein originalName gespeichert
     nameMismatch: number;    // originalName passt nicht zum Basisnamen
     currentMissing: number;  // "(n)"-Datei liegt nicht auf der Platte
-    collisionPair: number;   // Basisdatei existiert ebenfalls (Duplikat-Verdacht)
+    collisionPair: number;   // Basisdatei existiert ebenfalls, Inhalt unterschiedlich
     targetMissing: number;   // Basisname ist frei -> Kandidat
+    resolveDuplicate: number; // F23: Basisdatei hash-identisch -> auflösbar
+}
+
+// F24: Einzel-Eintrag der Dateinamen-Prüfung (für den Info-Tab).
+export interface RenameCheckEntry {
+    id: string;
+    currentName: string;
+    newName?: string;
+    originalName?: string;
+    timestamp: number;
+    status: 'protected' | 'noName' | 'nameMismatch' | 'missing'
+          | 'collision' | 'resolveDuplicate' | 'renamable';
 }
 
 // Global Window Interface für Electron
@@ -163,7 +184,7 @@ declare global {
       saveDatabase: (filePath: string, data: FileDatabase) => Promise<boolean>;
       saveTextFile: (filePath: string, content: string) => Promise<{success: boolean, path?: string, error?: string}>; // NEU: CSV Export
       checkIntegrity: (basePath: string, files: Record<string, DatabaseEntry>, onlySubset?: boolean) => Promise<IntegrityResult>;
-      findRenamableFiles: (basePath: string, files: Record<string, DatabaseEntry>) => Promise<{ candidates: RenamableFile[], stats: RenamableStats }>;
+      findRenamableFiles: (basePath: string, files: Record<string, DatabaseEntry>) => Promise<{ candidates: RenamableFile[], stats: RenamableStats, entries?: RenameCheckEntry[] }>;
       verifyFileIntegrityBatch: (basePath: string, files: {id: string, filename: string, timestamp: number}[]) => Promise<Record<string, 'ok' | 'corrupt'>>; // NEU
 
       // Download
