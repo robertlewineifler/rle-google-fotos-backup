@@ -124,11 +124,12 @@ dist/, release/              Build-Artefakte (via .gitignore ausgeschlossen)
 ### 4.3 Einzel-Download („⬇ 1“)
 - Nur wenn nicht `isWalking`, Zielordner vorhanden und URL-Kontext nicht Suche/Album/Share.
 - Liest Metadaten (ggf. Infopanel-Toggle), prüft DB + physische Existenz, lädt sonst einzeln herunter. **Trusted ist hier immer `true`** (kein Stale-Panel-Detektor).
+- **F20:** Die physische Existenz wird **immer** geprüft (auch bei gesetztem `missingSince`). Existiert die Datei bereits, wird kein Download erzwungen; ein stale `missingSince` wird gelöscht, die Orphan-Liste aktualisiert und sofort gespeichert (verhindert `(1)`-Kopien durch veraltete Flags).
 - **F10b:** wartet **ohne Zeitlimit** auf den Start; davor werden offene frühere Einzel-Starts verworfen (`discardPendingStarts` → `cancelPendingDownload`).
 - Kein Album-/Scan-Tracking.
 
 ### 4.4 Download-Ergebnis (Frontend `onDownloadComplete`)
-- Bei Erfolg wird die ID aus `skippedDownloads` entfernt (F10). War ein Eintrag betroffen (z. B. manueller Nachlade-Download), wird die DB **sofort gespeichert** – aber erst **am Ende** des Success-Blocks, nachdem der neue `files`-Eintrag geschrieben wurde (sonst fehlt er im Snapshot); sonst gelten weiterhin die regulären Speicherpunkte.
+- Bei Erfolg wird die ID aus `skippedDownloads` entfernt (F10). Die DB wird **sofort gespeichert** (erst **am Ende** des Success-Blocks, nachdem der neue `files`-Eintrag geschrieben wurde), wenn `wasSkipped || wasMissing || wasOnlineMissing || !isWalkingRef.current` – also bei Skip-/Orphan-Auflösung oder jedem manuellen Einzeldownload (F20); sonst gelten weiterhin die regulären Speicherpunkte.
 - **F17:** Vor dem Überschreiben des Eintrags werden `missingSince`/`onlineMissingSince` des Vorgängers gemerkt; nach dem Schreiben werden `updateOrphansList()`/`updateOnlineMissingList()` aufgerufen, damit wiederhergestellte Dateien sofort aus den Korrektur-Listen verschwinden.
 - `saveDatabase` liest den DB-Pfad aus `dbFilePathRef` (nicht aus dem State), damit auch Callback-Closures des ersten Renders (dieser Listener) korrekt speichern können.
 - Haupt-Backup: Eintrag in `dbRef.current.files[id]` mit `filename`, `originalName`, `timestamp` (= finales Datum), `savedAt`, `downloadedAt`, `scannedAt`, `originalDate` (EXIF-String), `hash`, `sourceHash`. **`integrityStatus` wird absichtlich NICHT gesetzt** → Datei gilt als „ungeprüft“.
@@ -255,6 +256,7 @@ Schreibt `YYYY:MM:DD HH:MM:SS` in:
 - **Duplikaterkennung (F6):** ausschließlich **hash-basiert** über alle validen Dateien. Die frühere Dateinamen-Heuristik (`Name (n).ext` + gleiche Größe ± 2 s mtime) wurde entfernt, weil sie legitime, online vorhandene Google-Fotos mit gleichem Namen fälschlich als Duplikate markiert hat (Re-Download-Zyklus).
 - Ergebnis wird im Frontend in die DB übernommen (Hashes, Größen), `missing` sofort als `missingSince` markiert, dann DB-Speichern.
 - **F17-Selbstheilung:** Einträge mit `missingSince`, die **nicht** in `result.missing` stehen (Datei wieder vorhanden), verlieren das Flag (Log „Vermisst-Status zurückgesetzt…“); `updateOrphansList()` läuft danach **immer** (auch bei 0 neuen Missing-Einträgen), damit die Korrektur-Liste nie veraltet bleibt.
+- **F21-Untracked-Scan:** Zusätzlich werden die Ordner `<basePath>/<YYYY>/<MM>/` nach Dateien durchsucht, die in **keinem** DB-Eintrag referenziert sind (`untracked` in `IntegrityResult`). Alben/Backups/Logs sind ausgenommen (nur 4-stellige Jahres-/2-stellige Monatsordner). Für jede verwaiste Datei wird der SHA-256 berechnet und mit bekannten Hashes verglichen → `duplicateOf` („Duplikat von <Datei>“). Das Integrity-Modal zeigt die Sektion „Verwaiste Dateien“ mit Explorer/Anzeigen/Löschen (Löschen nutzt das bestehende `delete-file`-IPC, kein neuer Kanal).
 
 ### 8.2 Inhalts-Check / Deep Scan (IPC `verify-file-integrity-batch` / „💾 Inhalt prüfen“)
 - Chunks von **100** Dateien (F15); pro Datei:
@@ -396,7 +398,7 @@ Alle Kanalnamen exakt so (main.cjs `ipcMain`):
 - **StartupScreen** solange `!isInitialized`.
 - **Webview-Bereich** oben (`https://photos.google.com`, `allowpopups`). Overlays:
   - Download-Fortschrittsbalken (links oben, bis 5 gleichzeitig). **F11:** Während des Wartens auf `download-started` zeigt dieselbe Karte (stabiler Key `job:<id>`) „Warte auf Download…“, einen Sekunden-Timer und klein „max. 45 s“ (bzw. „ohne Limit“ beim Einzeldownload); beim Start wechselt sie in-place zum Fortschritt (kein Positionssprung, konstante Kartenhöhe durch reservierte Fußzeile). **F12:** feste Slots 1–5 (`slot` am Progress-Eintrag, oberster freier Slot); fertige Downloads hinterlassen unsichtbare Lücken, Karten rutschen nicht nach.
-  - „Turbo Backup“-Panel (rechts oben): `processedCount`, aktive Downloads x/5.
+  - Status-Infos im Header „Neue Dateien“ (unten rechts): Spinner = Backup läuft (`isWalking`), „Aktive Downloads: x/5“ (bei laufendem Backup oder aktiven Einzeldownloads). Kein Overlay oben rechts mehr.
 - **Untere Leiste (h-64):**
   - Links: Status, Scan-Historie-Button, Duplikat-Warnung, „Datenbank prüfen“, „Dateinamen bereinigen“, „Korrekturen“ (rot, wenn Orphans/Corrupt/Übersprungene/OnlineMissing), CSV-Export, Reset, Logout, Start/Stop, „⬇ 1“.
   - Mitte: Log-Fenster (nur relevante Meldungen, max. 300 Einträge, Button „Logs“ öffnet Ordner).
@@ -459,6 +461,8 @@ Diese Punkte sind bewusst dokumentiert, damit Agenten sie nicht für funktionier
 | K5 | kritisch | ~~Ein-Schritt-Lag: Panel-Refresh-Wait akzeptierte das Vorgängerfoto als „refreshed" (nur Signaturänderung geprüft) → jedes Foto bekam das Google-Datum des Vorgängers; Lag perpetuierte sich; `trusted=true` schrieb Falschdaten in EXIF/FS/DB~~ **behoben in F1.3/F1.4**: Namens-Anker + Resync (mit URL-Verifikation) + Session-Abbruch bei nicht behebbarem Desync; deterministischer Start per `loadURL` + Panel-Öffnungs-Check (der F1.3-Nudge erwies sich als Sackgasse und wurde entfernt). **Zusatzursache gefunden/behoben:** Der F1.2-Teilscan über den gecachten Panel-Container lieferte veraltete Panel-Inhalte (sichtbarer Panel war aktuell) → F1.2-Teilscan zurückgebaut, Vollscan wieder aktiv; `pendingInfo` bleibt. | App.tsx `waitForPanelRefresh`, `navigateAndVerifyChange`, `runBackupSession`, crawlerActions `extractCurrentImageInfo` |
 | F10 | mittel | ~~Große Videos: Google feuert `will-download` erst 11–32 s nach Shift+D; der 15-s-Timeout brach zu früh ab → verfrühte Timeout-Warnungen und (nach früher Folge-Config) Risiko falscher Zuordnung~~ **behoben in F10**: Start-Timeout 45 s; Timeout-Fälle werden in `skippedDownloads` geführt (Korrektur-Modal, „🌐 Web öffnen“, „✖ Ignorieren“); `cancel-pending-download` entwertet die Config; späte Starts werden per `preventDefault` verworfen; Einzeldownload ohne Limit (F10b). Stop wartet bewusst den 45-s-Timeout ab. | App.tsx, main.cjs |
 | F17 | mittel | Wiederhergestellte Dateien blieben in „Korrekturen → Vermisste Dateien“ stehen: `onDownloadComplete` ersetzt den DB-Eintrag (Flag weg), aktualisierte aber den `orphans`-State nicht; der Struktur-Check rief `updateOrphansList()` nur bei neuen Missing-Einträgen auf und löschte `missingSince` nie für wieder vorhandene Dateien. **Behoben in F17**: Flags vor dem Überschreiben merken + Listen-Refresh; Struktur-Check heilt `missingSince` selbst und aktualisiert die Liste immer. | App.tsx `onDownloadComplete`/`handleIntegrityCheckDone` |
+| F20 | mittel | Einzeldownloads wurden nicht sofort persistiert; nach Reload kam ein bereits geheilter `missingSince`-Stand zurück. Zusätzlich erzwang `handleSingleDownload` bei gesetztem `missingSince` einen Download ohne Existenzprüfung → `(1)`-Kopie, obwohl die Datei existierte. **Behoben in F20**: Speichern bei `wasSkipped/wasMissing/wasOnlineMissing` oder manuellem Einzeldownload; Existenzprüfung immer, stale Flag wird ohne Download zurückgesetzt. | App.tsx `onDownloadComplete`/`handleSingleDownload` |
+| F21 | mittel | Verwaiste Dateien (auf der Platte, in keinem DB-Eintrag – z. B. `(1)`-Kollisionsreste) wurden von Struktur-Check/Namensbereinigung nie erkannt, weil beide nur DB-Einträge betrachten. **Behoben in F21**: `check-db-integrity` scannt `<YYYY>/<MM>` nach untracked Dateien, vergleicht Hashes („Duplikat von …“) und zeigt sie im Integrity-Modal mit Explorer/Anzeigen/Löschen. | main.cjs `check-db-integrity`, ActionModals.tsx |
 
 ---
 
@@ -489,7 +493,7 @@ Diese Punkte sind bewusst dokumentiert, damit Agenten sie nicht für funktionier
 | **Orphan / vermisst** | DB-Eintrag mit `missingSince`, Datei fehlt lokal |
 | **onlineMissing** | DB-Eintrag mit `onlineMissingSince`: Datei lokal vorhanden, aber online im Scan nicht gesehen |
 | **corrupt** | Datei mit 0 Bytes oder Lesefehler (`integrityStatus === 'corrupt'`) |
-| **Turbo-Backup** | Der parallele Crawler-Loop (max. 5 gleichzeitige Downloads) |
+| **Backup-Loop** | Der parallele Crawler-Loop (max. 5 gleichzeitige Downloads) |
 | **Download-Checkpoint** | Nach je 25 erfolgreichen Haupt-Backup-Downloads wird die DB gespeichert (F15) |
 | **scannedDays** | `YYYY-MM-DD` → Scan-Zeitpunkt; Grundlage der Heatmap und Orphan-Prüfung |
 | **Übersprungen / skippedDownloads** | Foto mit Download-Start-Timeout (45 s); Key = Google-ID, gelistet im Korrektur-Modal (F10) |

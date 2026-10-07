@@ -108,6 +108,17 @@ export interface IntegrityError {
     errorType?: 'missing' | 'corrupt'; // NEU: Unterscheidung
 }
 
+// F21: Datei auf der Platte, die in keinem DB-Eintrag referenziert ist.
+export interface UntrackedFile {
+    path: string;         // vollständiger Pfad
+    filename: string;
+    year: string;
+    month: string;
+    size: number;
+    hash?: string;
+    duplicateOf?: string; // Dateiname eines getrackten Fotos mit identischem Hash
+}
+
 export interface IntegrityResult {
     missing: IntegrityError[];
     duplicates: { hash: string; ids: string[] }[];
@@ -116,6 +127,7 @@ export interface IntegrityResult {
     updates: Record<string, string>; // ID -> Calculated Hash (for migration)
     sizeUpdates?: Record<string, number>; // NEU: ID -> Dateigröße in Bytes
     legacyCount?: number; // NEU: Anzahl veralteter Einträge
+    untracked?: UntrackedFile[]; // F21: verwaiste Dateien auf der Platte
 }
 
 export interface RenamableFile {

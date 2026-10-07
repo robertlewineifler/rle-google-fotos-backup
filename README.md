@@ -17,7 +17,7 @@ Alle Daten bleiben lokal auf deinem Rechner. Es gibt keine Cloud-Anbindung, kein
 - **Vollständiges Backup** der Google-Fotos-Bibliothek über den eingebetteten Browser
 - **Fortsetzbare Backups** dank JSON-Datenbank (`gphotos_db.json`)
 - **Automatische EXIF-Korrektur** – Dateisystem-Zeitstempel, JPEG-EXIF und Video-Metadaten werden auf das Original-Aufnahmedatum gesetzt
-- **Parallele Downloads** (Turbo-Modus, bis zu 5 gleichzeitig)
+- **Parallele Downloads** (bis zu 5 gleichzeitig)
 - **Live Photos** – ZIP-Downloads werden automatisch entpackt
 - **Duplikaterkennung** über SHA-256-Hashes und Metadaten-Heuristiken
 - **Integritätsprüfung** – findet fehlende, defekte und duplizierte Dateien

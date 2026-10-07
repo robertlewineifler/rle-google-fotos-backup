@@ -655,8 +655,63 @@ ipcMain.handle('check-db-integrity', async (event, { basePath, files, onlySubset
     });
 
     const duplicates = Object.entries(hashRegistry).filter(([_, ids]) => ids.length > 1).map(([hash, ids]) => ({ hash, ids }));
-    // NEU: sizeUpdates zurückgeben
-    return { missing, duplicates, updates, sizeUpdates, total: entries.length };
+
+    // F21: Verwaiste Dateien finden – Dateien in <basePath>/<YYYY>/<MM>/, die in keinem DB-Eintrag stehen.
+    // Alben/Backups/Logs werden nicht erfasst (nur 4-stellige Jahres- und 2-stellige Monatsordner).
+    const untracked = [];
+    try {
+        if (basePath && fs.existsSync(basePath)) {
+            const trackedPaths = new Set();
+            for (const [id, entry] of entries) {
+                const d = new Date(entry.timestamp);
+                const y = d.getFullYear().toString();
+                const m = (d.getMonth() + 1).toString().padStart(2, '0');
+                trackedPaths.add(path.join(basePath, y, m, entry.filename).toLowerCase());
+            }
+
+            // Bekannte Hashes für den Duplikat-Abgleich (gespeicherter Hash oder frisch berechnet)
+            const hashToFilename = {};
+            for (const [id, entry] of entries) {
+                const h = updates[id] || entry.hash;
+                if (h && !hashToFilename[h]) hashToFilename[h] = entry.filename;
+            }
+
+            const yearDirs = fs.readdirSync(basePath, { withFileTypes: true })
+                .filter(d => d.isDirectory() && /^\d{4}$/.test(d.name));
+            for (const yd of yearDirs) {
+                const yearPath = path.join(basePath, yd.name);
+                let monthDirs = [];
+                try { monthDirs = fs.readdirSync(yearPath, { withFileTypes: true }).filter(d => d.isDirectory() && /^\d{2}$/.test(d.name)); } catch (e) { continue; }
+                for (const md of monthDirs) {
+                    const monthPath = path.join(yearPath, md.name);
+                    let dirFiles = [];
+                    try { dirFiles = fs.readdirSync(monthPath, { withFileTypes: true }).filter(f => f.isFile()); } catch (e) { continue; }
+                    for (const f of dirFiles) {
+                        const fullPath = path.join(monthPath, f.name);
+                        if (trackedPaths.has(fullPath.toLowerCase())) continue;
+                        let size = 0;
+                        try { size = fs.statSync(fullPath).size; } catch (e) { continue; }
+                        let hash;
+                        try { hash = await getFileHash(fullPath); } catch (e) { /* Hash optional */ }
+                        untracked.push({
+                            path: fullPath,
+                            filename: f.name,
+                            year: yd.name,
+                            month: md.name,
+                            size,
+                            hash,
+                            duplicateOf: hash ? hashToFilename[hash] : undefined
+                        });
+                    }
+                }
+            }
+        }
+    } catch (e) {
+        appendLog('warning', `Untracked-Scan fehlgeschlagen: ${e.message}`);
+    }
+
+    // NEU: sizeUpdates + untracked zurückgeben
+    return { missing, duplicates, updates, sizeUpdates, total: entries.length, untracked };
 });
 
 // Sucht Dateien wie "IMG_1234 (1).jpg", deren Basisname "IMG_1234.jpg" NICHT existiert.

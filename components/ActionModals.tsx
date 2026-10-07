@@ -1,6 +1,6 @@
 
 import React, { useState, useEffect, useMemo } from 'react';
-import { DatabaseEntry, IntegrityResult, RenamableFile, SkippedDownload } from '../types';
+import { DatabaseEntry, IntegrityResult, RenamableFile, SkippedDownload, UntrackedFile } from '../types';
 
 interface CorrectionModalProps {
     orphans: { id: string, entry: DatabaseEntry }[];
@@ -370,18 +370,44 @@ interface IntegrityReportModalProps {
     onCleanLegacy?: () => void;
     onUpdateFileStatus?: (updates: Record<string, 'ok' | 'corrupt'>) => void;
     onDeleteCorruptFile?: (id: string) => Promise<boolean>;
+    // F21: verwaiste Dateien (nicht in der DB)
+    onDeleteUntrackedFile?: (file: UntrackedFile) => Promise<boolean>;
+    onShowUntrackedInExplorer?: (fullPath: string) => void;
+    onOpenUntracked?: (fullPath: string) => void;
 }
 
 type ModalMode = 'menu' | 'structure_running' | 'structure_result' | 'content_dashboard' | 'content_running' | 'content_result';
 
 export const IntegrityReportModal: React.FC<IntegrityReportModalProps> = ({ 
     initialResult, basePath, files, onClose, onCheckDone, onExecuteDuplicates, 
-    onShowMissing, onCleanLegacy, onUpdateFileStatus, onDeleteCorruptFile 
+    onShowMissing, onCleanLegacy, onUpdateFileStatus, onDeleteCorruptFile,
+    onDeleteUntrackedFile, onShowUntrackedInExplorer, onOpenUntracked
 }) => {
     
     // Status Logic
     const [mode, setMode] = useState<ModalMode>(initialResult ? 'structure_result' : 'menu');
     const [structureResult, setStructureResult] = useState<IntegrityResult | null>(initialResult);
+    // F21: lokale Liste der verwaisten Dateien (Zeilen nach Löschen entfernen)
+    const [untrackedFiles, setUntrackedFiles] = useState<UntrackedFile[]>(initialResult?.untracked || []);
+
+    useEffect(() => {
+        setUntrackedFiles(structureResult?.untracked || []);
+    }, [structureResult]);
+
+    const handleDeleteUntracked = async (file: UntrackedFile) => {
+        if (!onDeleteUntrackedFile) return;
+        const ok = await onDeleteUntrackedFile(file);
+        if (ok) setUntrackedFiles(prev => prev.filter(f => f.path !== file.path));
+    };
+
+    const handleDeleteAllUntracked = async () => {
+        if (!onDeleteUntrackedFile || untrackedFiles.length === 0) return;
+        if (!confirm(`Wirklich alle ${untrackedFiles.length} verwaisten Dateien von der Festplatte löschen?`)) return;
+        for (const f of [...untrackedFiles]) {
+            const ok = await onDeleteUntrackedFile(f);
+            if (ok) setUntrackedFiles(prev => prev.filter(x => x.path !== f.path));
+        }
+    };
     
     // Content Check State
     const [progress, setProgress] = useState(0);
@@ -639,7 +665,8 @@ export const IntegrityReportModal: React.FC<IntegrityReportModalProps> = ({
         const duplicates = result.duplicates || [];
         const missingCount = result.missing.length;
         const legacyCount = result.legacyCount || 0;
-        const isClean = duplicates.length === 0 && missingCount === 0 && legacyCount === 0;
+        const untrackedCount = untrackedFiles.length; // F21
+        const isClean = duplicates.length === 0 && missingCount === 0 && legacyCount === 0 && untrackedCount === 0;
 
         return (
             <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-[80] p-8">
@@ -650,7 +677,7 @@ export const IntegrityReportModal: React.FC<IntegrityReportModalProps> = ({
                   </div>
                   
                   {/* Summary Grid */}
-                  <div className="grid grid-cols-3 gap-2 p-4 bg-slate-900 border-b border-slate-700">
+                  <div className="grid grid-cols-4 gap-2 p-4 bg-slate-900 border-b border-slate-700">
                       <div className={`bg-slate-800 p-2 rounded text-center border ${missingCount > 0 ? 'border-red-900/50 bg-red-900/10' : 'border-transparent'}`}>
                           <div className="text-[10px] uppercase text-slate-500 font-bold">Vermisst</div>
                           <div className={`text-xl font-bold ${missingCount > 0 ? 'text-red-400' : 'text-slate-400'}`}>{missingCount}</div>
@@ -663,6 +690,10 @@ export const IntegrityReportModal: React.FC<IntegrityReportModalProps> = ({
                           <div className="text-[10px] uppercase text-slate-500 font-bold">Veraltet</div>
                           <div className={`text-xl font-bold ${legacyCount > 0 ? 'text-blue-400' : 'text-slate-400'}`}>{legacyCount}</div>
                       </div>
+                      <div className={`bg-slate-800 p-2 rounded text-center border ${untrackedCount > 0 ? 'border-orange-900/50 bg-orange-900/10' : 'border-transparent'}`}>
+                          <div className="text-[10px] uppercase text-slate-500 font-bold">Verwaist</div>
+                          <div className={`text-xl font-bold ${untrackedCount > 0 ? 'text-orange-400' : 'text-slate-400'}`}>{untrackedCount}</div>
+                      </div>
                   </div>
 
                   <div className="p-4 overflow-y-auto flex-1 bg-slate-900/30">
@@ -670,7 +701,7 @@ export const IntegrityReportModal: React.FC<IntegrityReportModalProps> = ({
                           <div className="flex flex-col items-center justify-center h-full text-slate-500 py-10">
                               <div className="text-4xl mb-2">✅</div>
                               <div className="font-bold text-lg text-slate-300">Struktur OK</div>
-                              <div className="text-xs">Keine Duplikate oder fehlende Dateien.</div>
+                              <div className="text-xs">Keine Duplikate, fehlenden oder verwaisten Dateien.</div>
                           </div>
                       ) : (
                           <div className="flex flex-col gap-4">
@@ -681,6 +712,47 @@ export const IntegrityReportModal: React.FC<IntegrityReportModalProps> = ({
                                   </div>
                               )}
                               {duplicates.length > 0 && <p className="text-sm text-slate-300">Gefundene Duplikat-Gruppen: {duplicates.length}</p>}
+
+                              {/* F21: Verwaiste Dateien (auf der Platte, nicht in der DB) */}
+                              {untrackedCount > 0 && (
+                                  <div className="bg-orange-900/10 border border-orange-900/40 rounded p-3">
+                                      <div className="flex justify-between items-center mb-2">
+                                          <div className="text-sm font-bold text-orange-300">Verwaiste Dateien ({untrackedCount})</div>
+                                          <div className="text-[10px] text-slate-400">Auf der Platte, aber in keinem DB-Eintrag</div>
+                                      </div>
+                                      <div className="border border-slate-700 rounded bg-slate-900/30 max-h-[240px] overflow-y-auto">
+                                          <table className="w-full text-left text-xs text-slate-300">
+                                              <thead className="bg-slate-800 text-slate-400 uppercase font-bold sticky top-0">
+                                                  <tr>
+                                                      <th className="p-2">Dateiname</th>
+                                                      <th className="p-2">Ordner</th>
+                                                      <th className="p-2">Größe</th>
+                                                      <th className="p-2">Hinweis</th>
+                                                      <th className="p-2 text-right">Aktion</th>
+                                                  </tr>
+                                              </thead>
+                                              <tbody>
+                                                  {untrackedFiles.map((f, i) => (
+                                                      <tr key={i} className="border-b border-slate-700 hover:bg-slate-800/50">
+                                                          <td className="p-2 font-mono text-orange-200 break-all">{f.filename}</td>
+                                                          <td className="p-2 text-slate-400 whitespace-nowrap">{f.year}/{f.month}</td>
+                                                          <td className="p-2 text-slate-400 whitespace-nowrap">{(f.size / 1024 / 1024).toFixed(1)} MB</td>
+                                                          <td className="p-2 whitespace-nowrap">{f.duplicateOf ? <span className="text-amber-300">Duplikat von {f.duplicateOf}</span> : <span className="text-slate-500">nicht in DB</span>}</td>
+                                                          <td className="p-2 text-right whitespace-nowrap">
+                                                              <button onClick={() => onShowUntrackedInExplorer?.(f.path)} className="bg-slate-600 hover:bg-slate-500 text-white px-2 py-1 rounded text-[10px] mr-1" title="Im Windows Explorer anzeigen">📂</button>
+                                                              <button onClick={() => onOpenUntracked?.(f.path)} className="bg-emerald-700 hover:bg-emerald-600 text-white px-2 py-1 rounded text-[10px] mr-1" title="Im Standard-Viewer öffnen">🖼️</button>
+                                                              <button onClick={() => handleDeleteUntracked(f)} className="bg-red-700 hover:bg-red-600 text-white px-2 py-1 rounded text-[10px]" title="Datei von der Festplatte löschen">🗑 Löschen</button>
+                                                          </td>
+                                                      </tr>
+                                                  ))}
+                                              </tbody>
+                                          </table>
+                                      </div>
+                                      <div className="flex justify-end mt-2">
+                                          <button onClick={handleDeleteAllUntracked} className="bg-orange-800 hover:bg-orange-700 text-white px-4 py-2 rounded text-sm font-bold shadow border border-orange-600">Alle {untrackedCount} löschen</button>
+                                      </div>
+                                  </div>
+                              )}
                           </div>
                       )}
                   </div>

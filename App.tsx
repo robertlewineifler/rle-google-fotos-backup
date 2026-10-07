@@ -1,7 +1,7 @@
 
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { ProcessingLog, DownloadedFile, DownloadResult, FileDatabase, DatabaseEntry, IntegrityResult, DownloadProgress, RenamableFile, SkippedDownload } from './types';
+import { ProcessingLog, DownloadedFile, DownloadResult, FileDatabase, DatabaseEntry, IntegrityResult, DownloadProgress, RenamableFile, SkippedDownload, UntrackedFile } from './types';
 import { parseGoogleDateString, parseExifDateToDate, getIsoDateString } from './utils/exifUtils';
 import * as Crawler from './logic/crawlerActions';
 import * as DbUtils from './logic/databaseUtils';
@@ -335,6 +335,10 @@ const App: React.FC = () => {
                   // F10: erfolgreich nachgeladen -> aus Übersprungen-Liste entfernen.
                   // Persistiert wird erst am Ende des Blocks, damit der Snapshot auch den neuen files-Eintrag enthält.
                   const wasSkipped = removeSkippedPhoto(result.id);
+                  // F17/F20: Flags vor dem Überschreiben merken (Listen-Refresh + sofortiges Persistieren)
+                  const prevEntry = dbRef.current.files[result.id];
+                  const wasMissing = !!prevEntry?.missingSince;
+                  const wasOnlineMissing = !!prevEntry?.onlineMissingSince;
                   newDownloadMetaRef.current.set(result.id, { filename: result.filename, originalDate: result.originalExifDate || undefined });
                   const ext = result.filename.split('.').pop()?.toLowerCase();
                   const isVideo = ['mp4', 'mov', 'm4v', 'avi', '3gp', 'mpg'].includes(ext || '');
@@ -369,11 +373,6 @@ const App: React.FC = () => {
                       
                       setDownloadedFiles(prev => [...prev, entry].slice(-100));
                       
-                      // F17: Flags vor dem Überschreiben merken (Listen-Refresh nach Wiederherstellung)
-                      const prevEntry = dbRef.current.files[result.id];
-                      const wasMissing = !!prevEntry?.missingSince;
-                      const wasOnlineMissing = !!prevEntry?.onlineMissingSince;
-
                       // DB UPDATE: Jetzt mit originalName
                       dbRef.current.files[result.id] = {
                           filename: result.filename, 
@@ -397,8 +396,9 @@ const App: React.FC = () => {
                       addLog(`Download fertig: ${result.filename}`, 'success');
                   }
 
-                  // F10: Jetzt enthält der DB-Snapshot sowohl die Skip-Entfernung als auch den neuen files-Eintrag.
-                  if (wasSkipped) void saveDatabase();
+                  // F20: Jetzt enthält der DB-Snapshot Skip-Entfernung, neue Flags UND den neuen files-Eintrag.
+                  // Persistieren bei Skip-/Orphan-Auflösung oder bei manuellem Einzeldownload (nicht im Loop).
+                  if (wasSkipped || wasMissing || wasOnlineMissing || !isWalkingRef.current) void saveDatabase();
               } else {
                   if (isAlbumModeRef.current) {
                       addLog(`[ALBUM] Fehler beim Download (${result.id}): ${result.error}`, 'album');
@@ -1023,6 +1023,26 @@ const App: React.FC = () => {
       else addLog(`Datei geöffnet: ${entry.filename}`, 'info');
   };
 
+  // F21: verwaiste Datei löschen (bestehendes delete-file-IPC mit Jahr/Monat aus dem Scan).
+  const handleDeleteUntrackedFile = async (file: UntrackedFile): Promise<boolean> => {
+      if (!window.electron || !exportPath) return false;
+      const ts = new Date(Number(file.year), Number(file.month) - 1, 1).getTime();
+      const deleted = await window.electron.deleteFile({ basePath: exportPath, filename: file.filename, timestamp: ts });
+      if (deleted) addLog(`Verwaiste Datei gelöscht: ${file.filename} (${file.year}/${file.month})`, 'success');
+      else addLog(`Löschen fehlgeschlagen (verwaiste Datei): ${file.filename}`, 'warning');
+      return deleted;
+  };
+
+  const handleShowUntrackedInExplorer = (fullPath: string) => {
+      if (window.electron) void window.electron.showItemInFolder(fullPath);
+  };
+
+  const handleOpenUntracked = async (fullPath: string) => {
+      if (!window.electron) return;
+      const err = await window.electron.openFile(fullPath);
+      if (err) addLog(`Öffnen fehlgeschlagen: ${err}`, 'warning');
+  };
+
   const resetProgramState = () => {
       // 1. Stop Flag
       isWalkingRef.current = false;
@@ -1247,8 +1267,9 @@ const App: React.FC = () => {
           const existing = dbRef.current.files[result.id];
           let needsDownload = true;
 
-          if (existing && !existing.missingSince) {
-              // NEU: Prüfe physische Existenz, bevor wir "Vorhanden" sagen.
+          if (existing) {
+              // F20: physische Existenz IMMER prüfen – auch bei gesetztem missingSince (Stale-Flag-Schutz,
+              // verhindert Doppel-Downloads als "(1)"-Kopien).
               const exists = await window.electron.checkFileExists({
                   basePath: exportPath,
                   filename: existing.filename,
@@ -1257,7 +1278,14 @@ const App: React.FC = () => {
 
               if (exists) {
                   needsDownload = false;
-                  addLog(`Info: Datei ${result.id} bereits vorhanden. Download übersprungen.`, 'warning');
+                  if (existing.missingSince) {
+                      delete existing.missingSince;
+                      updateOrphansList();
+                      void saveDatabase();
+                      addLog(`Status korrigiert: ${existing.filename} ist lokal vorhanden – Vermisst-Status zurückgesetzt, kein Download.`, 'success');
+                  } else {
+                      addLog(`Info: Datei ${result.id} bereits vorhanden. Download übersprungen.`, 'warning');
+                  }
               } else {
                   addLog(`Datei in DB aber nicht auf Platte. Erzwinge Download...`, 'warning');
                   needsDownload = true;
@@ -1459,7 +1487,7 @@ const App: React.FC = () => {
     if (isAlbumMode) {
       addLog(`[ALBUM] Starte separaten Album-Download nach ${albumTargetPathRef.current}...`, 'album');
     } else {
-      addLog('Starte Turbo-Backup (Parallel)...', 'info');
+      addLog('Starte Backup (Parallel)...', 'info');
     }
 
     // Panel-Toggle nur im Album-Modus (dort wird nicht gescraped)
@@ -1906,6 +1934,9 @@ const App: React.FC = () => {
             onCleanLegacy={executeCleanLegacy}
             onUpdateFileStatus={handleIntegrityStatusUpdate}
             onDeleteCorruptFile={handleRemoveCorruptFile}
+            onDeleteUntrackedFile={handleDeleteUntrackedFile}
+            onShowUntrackedInExplorer={handleShowUntrackedInExplorer}
+            onOpenUntracked={handleOpenUntracked}
           /> 
       )}
       {/* MISSING FILES MODAL REMOVED - now handled by CorrectionModal */}
@@ -1950,13 +1981,6 @@ const App: React.FC = () => {
             {unslottedProgress.map(([key, progress]) => renderProgressCard(key, progress))}
         </div>
 
-        {isWalking && (
-            <div className="absolute top-4 right-4 bg-slate-800/90 text-white p-4 rounded shadow-xl border border-blue-500 z-50">
-                <div className="flex items-center gap-3"><div className="animate-spin rounded-full h-4 w-4 border-t-2 border-white"></div><div className="font-bold">Turbo Backup</div></div>
-                <div className="text-sm mt-1 text-slate-300">Neu gefunden: {processedCount}</div>
-                <div className="text-xs text-slate-400 mt-1">Aktive Downloads: {activeDownloadsCount} / 5</div>
-            </div>
-        )}
       </div>
 
       <div className="h-64 flex flex-col md:flex-row bg-slate-800 shrink-0 border-b border-slate-700">
@@ -2024,7 +2048,18 @@ const App: React.FC = () => {
         </div>
 
         <div className="flex-1 p-3 flex flex-col min-w-0">
-             <div className="flex justify-between items-center mb-1"><h3 className="font-bold text-slate-400 uppercase text-xs tracking-wider">Neue Dateien ({processedCount})</h3><button onClick={() => setDownloadedFiles([])} className="text-[10px] text-slate-500 hover:text-white">Leeren</button></div>
+             <div className="flex justify-between items-center mb-1">
+                 <h3 className="font-bold text-slate-400 uppercase text-xs tracking-wider flex items-center gap-2">
+                     {isWalking && <span className="animate-spin rounded-full h-3 w-3 border-t-2 border-blue-400 inline-block" title="Backup läuft"></span>}
+                     Neue Dateien ({processedCount})
+                 </h3>
+                 <div className="flex items-center gap-3">
+                     {(isWalking || activeDownloadsCount > 0) && (
+                         <span className="text-[10px] text-slate-400">Aktive Downloads: <span className="font-mono text-slate-200">{activeDownloadsCount} / 5</span></span>
+                     )}
+                     <button onClick={() => setDownloadedFiles([])} className="text-[10px] text-slate-500 hover:text-white">Leeren</button>
+                 </div>
+             </div>
              <div className="flex-1 bg-slate-900 rounded border border-slate-700 overflow-hidden flex flex-col">
                 <div className="flex bg-slate-800 text-[10px] text-slate-400 p-2 font-bold border-b border-slate-700"><div className="w-6 text-center"></div><div className="flex-1 px-1">Name</div><div className="w-24">Web</div><div className="w-24">Original</div><div className="w-12 text-center">Status</div></div>
                 <div className="flex-1 overflow-y-auto scrollbar-thin p-0" ref={tableContainerRef}>
