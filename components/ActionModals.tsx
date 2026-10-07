@@ -244,7 +244,6 @@ export const IntegrityReportModal: React.FC<IntegrityReportModalProps> = ({
         setMode('structure_running');
         try {
              // Pass flag to backend
-             // @ts-ignore - Argument extension in main/preload
              const result = await window.electron.checkIntegrity(basePath, files, onlySubset);
              setStructureResult(result);
              
@@ -254,7 +253,7 @@ export const IntegrityReportModal: React.FC<IntegrityReportModalProps> = ({
              const validKeys = new Set([
                   'filename', 'timestamp', 'originalDate', 'originalName', 
                   'savedAt', 'downloadedAt', 'scannedAt', 'hash', 'sourceHash', 'missingSince', 'id',
-                  'integrityStatus', 'integrityCheckedAt', 'size'
+                  'integrityStatus', 'integrityCheckedAt', 'size', 'onlineMissingSince'
              ]);
              for(const id in files) {
                   const entry = files[id];

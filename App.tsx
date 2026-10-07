@@ -65,6 +65,13 @@ const App: React.FC = () => {
   // --- Stale-Panel-Schutz (0-ms-Detektor) ---
   const prevTrueMetaRef = useRef<{ id: string; filename?: string; originalDate?: string; webTimestamp?: number } | null>(null);
   const newDownloadMetaRef = useRef<Map<string, { filename: string; originalDate?: string }>>(new Map());
+  // --- Panel-Refresh-Wait (F1) ---
+  const lastPanelSignatureRef = useRef<string | null>(null);
+  const panelRefreshedRef = useRef(false); // Panel nach Navigation bestätigt aktualisiert
+  const panelSyncedRef = useRef(true);     // Panel gehört vermutlich zum aktuellen URL-Foto
+  const panelScrolledRef = useRef(false);  // F1.1: Panel-Scroll-Retry für dieses Foto bereits versucht
+  const pendingInfoRef = useRef<any>(null); // F1.2: bestätigtes Scrape-Ergebnis aus dem Panel-Refresh-Wait
+  const desyncAbortRef = useRef(false);     // F1.3: Panel-Desync nicht behebbar -> Session sauber abbrechen
   
   // --- Computed Stats ---
   // Zählt, an wie vielen Tagen das Programm tatsächlich benutzt wurde (Scan-Aktivität)
@@ -134,7 +141,7 @@ const App: React.FC = () => {
               Crawler.extractCurrentImageInfo(webviewRef.current),
               timeoutPromise
           ]);
-          return result as {id: string, dateStr: string, potentialFilename?: string};
+          return result as {id: string, dateStr: string, potentialFilename?: string, panelSignature: string};
       } catch (e: any) {
           // NEU: Fehler beim Reset ignorieren
           if (e.message && e.message.includes('GUEST_VIEW_MANAGER_CALL')) return null;
@@ -144,8 +151,82 @@ const App: React.FC = () => {
 
   // --- STALE-PANEL-DETEKTOR (kostet im Normalfall 0 ms) ---
   // Erkennt, ob der gerade gelesene Panel-Inhalt noch zum Vorgängerfoto gehört.
-  const evaluateScrapeTrust = (result: any, webTimestamp: number, entry?: DatabaseEntry): { trusted: boolean; reason: string } => {
+  const sameName = (a?: string | null, b?: string | null) => !!a && !!b && a.toLowerCase() === b.toLowerCase();
+  // Entfernt einen Kollisions-Suffix " (1)" vor der Endung (lokale Dateinamen).
+  const stripCollisionSuffix = (name?: string | null) => (name || '').replace(/\s\(\d+\)(\.[^.]+)$/, '$1');
+
+  // --- PANEL-REFRESH-WAIT (F1/F1.3) ---
+  // Wartet nach der Navigation darauf, dass das Info-Panel tatsächlich zum neuen Foto wechselt.
+  // "Refreshed" = Signatur weicht vom Vorgänger ab, entspricht NICHT dem Vorgängerfoto (Namens-Anker, F1.3)
+  //               und ist bei zwei aufeinanderfolgenden Reads stabil.
+  // prevSignature === null => nur auf Stabilität warten (Erst-Synchronisierung).
+  // Rückgabe: true = Panel bestätigt aktualisiert; false = Timeout/Abbruch.
+  const PANEL_REFRESH_INTERVAL_MS = 150;
+  const PANEL_REFRESH_TIMEOUT_MS = 3000;
+  const isPreviousPhotoPanel = (info: any): boolean => {
       const prev = prevTrueMetaRef.current;
+      const probeName = info?.potentialFilename;
+      if (!prev?.filename || !probeName) return false;
+      return stripCollisionSuffix(probeName).toLowerCase() === stripCollisionSuffix(prev.filename).toLowerCase();
+  };
+  const waitForPanelRefresh = async (prevSignature: string | null, timeoutMs: number = PANEL_REFRESH_TIMEOUT_MS): Promise<boolean> => {
+      const start = Date.now();
+      let candidate: string | null = null;
+      let lastProbe: { name: string; dateOk: boolean; texts: number; sig: string } | null = null;
+      while (Date.now() - start < timeoutMs) {
+          if (!isWalkingRef.current) return false;
+          await sleep(PANEL_REFRESH_INTERVAL_MS);
+          if (!isWalkingRef.current) return false;
+          const info = await safeExtractInfo();
+          if (!info?.panelSignature) {
+              lastProbe = { name: '(scrape null)', dateOk: false, texts: 0, sig: '-' };
+              continue;
+          }
+          lastProbe = {
+              name: info.potentialFilename || '-',
+              dateOk: !isNaN(parseGoogleDateString(info.dateStr || '').getTime()),
+              texts: (info.dateStr || '').split('\n').filter(Boolean).length,
+              sig: (info.panelSignature || '').substring(0, 10)
+          };
+          if (prevSignature !== null && info.panelSignature === prevSignature) {
+              candidate = null; // noch altes Panel
+              continue;
+          }
+          if (isPreviousPhotoPanel(info)) {
+              candidate = null; // F1.3: Panel zeigt nachweislich noch das Vorgängerfoto
+              continue;
+          }
+          if (candidate === info.panelSignature) {
+              pendingInfoRef.current = info; // F1.2: bestätigtes Ergebnis für die nächste Iteration puffern
+              return true; // stabil (und != vorher)
+          }
+          candidate = info.panelSignature;
+      }
+      // F1.4: Diagnose bei Timeout
+      if (lastProbe) {
+          addLog(`Panel-Wait-Timeout: name=${lastProbe.name} dateOk=${lastProbe.dateOk} texts=${lastProbe.texts} sig=${lastProbe.sig}`, 'debug');
+      } else {
+          addLog('Panel-Wait-Timeout ohne Probe (Scrape lieferte nie etwas).', 'debug');
+      }
+      return false;
+  };
+
+  const evaluateScrapeTrust = (panelRefreshed: boolean, result: any, webTimestamp: number, entry?: DatabaseEntry): { trusted: boolean; reason: string } => {
+      const prev = prevTrueMetaRef.current;
+      const candidate = result?.potentialFilename as string | undefined;
+
+      // Harte Namenssperre: Kandidat ist exakt der Name des Vorgängerfotos, aber nicht der eigene Name.
+      // Gilt auch bei bestätigtem Panel-Refresh (schützt vor Teil-Updates).
+      if (prev?.filename && candidate) {
+          const ownNames = [entry?.filename, entry?.originalName].filter(Boolean).map(n => n!.toLowerCase());
+          if (sameName(candidate, prev.filename) && !ownNames.includes(candidate.toLowerCase())) {
+              return { trusted: false, reason: 'Kandidat entspricht Vorgängername' };
+          }
+      }
+
+      // Panel wurde nach der Navigation nachweislich neu aufgebaut -> vertrauenswürdig.
+      if (panelRefreshed) return { trusted: true, reason: '' };
+
       if (!prev) return { trusted: true, reason: '' }; // Erstes Foto: Panel stand still
 
       let prevDate: number | null = null;
@@ -156,18 +237,21 @@ const App: React.FC = () => {
       if (prevDate === null && prev.webTimestamp) prevDate = prev.webTimestamp;
 
       if (prevDate === null && !prev.filename) {
-          return { trusted: false, reason: 'Vorgänger-Referenz unvollständig' };
+          // Referenz unvollständig: nicht blockieren (verhindert Untrusted-Kaskade), nur beobachten.
+          return { trusted: true, reason: 'Vorgänger-Referenz unvollständig (Fallback)' };
       }
 
       const within60 = (a: number, b: number) => Math.abs(a - b) <= 60000;
-      const sameName = (a?: string | null, b?: string | null) => !!a && !!b && a.toLowerCase() === b.toLowerCase();
 
-      const matchesPrev = (prevDate !== null && within60(webTimestamp, prevDate)) || sameName(result?.potentialFilename, prev.filename);
+      const matchesPrev = (prevDate !== null && within60(webTimestamp, prevDate)) || sameName(candidate, prev.filename);
 
       let matchesOwn = false;
       if (entry?.originalDate) {
           const od = parseExifDateToDate(entry.originalDate);
           if (od) matchesOwn = within60(webTimestamp, od.getTime());
+      }
+      if (!matchesOwn && entry?.timestamp) {
+          matchesOwn = within60(webTimestamp, entry.timestamp);
       }
 
       if (matchesPrev && !matchesOwn) {
@@ -333,7 +417,9 @@ const App: React.FC = () => {
                 }
                 loadedDb.hashScheme = 2;
                 try {
-                    await window.electron.saveDatabase(filePath, { ...loadedDb, basePath: '.' });
+                    const migrateSave = { ...loadedDb, basePath: '.' };
+                    delete migrateSave.dbFilePath; // F8: absoluten Altpfad nicht persistieren
+                    await window.electron.saveDatabase(filePath, migrateSave);
                     setTimeout(() => addLog(`🔀 Hash-Migration: ${migrated} Einträge (alter Hash -> sourceHash) gespeichert.`, 'info'), 700);
                 } catch (migErr) {
                     console.error("Hash-Migration konnte nicht gespeichert werden", migErr);
@@ -402,6 +488,7 @@ const App: React.FC = () => {
       if (!dbFilePath || !window.electron) return;
       dbRef.current.lastUpdated = Date.now();
       const dbToSave = { ...dbRef.current, basePath: '.' };
+      delete dbToSave.dbFilePath; // F8: absoluten Pfad nicht in die DB schreiben (kommt beim Laden aus dem Dateipfad)
       try {
           const success = await window.electron.saveDatabase(dbFilePath, dbToSave);
           if (!success) addLog("WARNUNG: Datenbank konnte nicht gespeichert werden!", 'error');
@@ -484,11 +571,15 @@ const App: React.FC = () => {
       const entry = dbRef.current.files[id];
       try {
           // 1. Physisch löschen
-          await window.electron.deleteFile({
+          const deleted = await window.electron.deleteFile({
               basePath: exportPath,
               filename: entry.filename,
               timestamp: entry.timestamp
           });
+          if (!deleted) {
+              addLog(`Löschen fehlgeschlagen (Datei bleibt bestehen, DB unverändert): ${entry.filename}`, 'warning');
+              return false;
+          }
           
           // 2. DB Eintrag ZURÜCKSETZEN (nicht löschen), damit Download neu getriggert wird
           // delete dbRef.current.files[id]; // <-- ALTE LOGIK
@@ -518,24 +609,30 @@ const App: React.FC = () => {
       addLog(`Lösche ${corrupt.length} defekte Dateien von Disk...`, 'info');
       
       let deletedCount = 0;
+      let failedCount = 0;
       for (const [id, entry] of corrupt) {
           try {
-              await window.electron.deleteFile({
+              const deleted = await window.electron.deleteFile({
                   basePath: exportPath,
                   filename: entry.filename,
                   timestamp: entry.timestamp
               });
+              if (!deleted) {
+                  failedCount++;
+                  addLog(`Löschen fehlgeschlagen (DB unverändert): ${entry.filename}`, 'warning');
+                  continue;
+              }
               if (dbRef.current.files[id]) {
                   delete dbRef.current.files[id].integrityStatus;
                   delete dbRef.current.files[id].hash;
               }
               deletedCount++;
-          } catch(e) { console.error(e); }
+          } catch(e) { console.error(e); failedCount++; }
       }
       
       await saveDatabase();
       setProcessedCount(prev => prev + 1);
-      addLog(`${deletedCount} defekte Dateien gelöscht. Bereit für Re-Download.`, 'success');
+      addLog(`${deletedCount} defekte Dateien gelöscht.${failedCount > 0 ? ` ${failedCount} fehlgeschlagen (siehe Warnungen).` : ''} Bereit für Re-Download.`, failedCount > 0 ? 'warning' : 'success');
   };
   
   // --- RENAME LOGIC ---
@@ -626,7 +723,7 @@ const App: React.FC = () => {
       const validKeys = new Set([
         'filename', 'timestamp', 'originalDate', 'originalName', 
         'savedAt', 'downloadedAt', 'scannedAt', 'hash', 'sourceHash', 'missingSince', 'id',
-        'integrityStatus', 'integrityCheckedAt', 'size' // NEU: 'size' is valid
+        'integrityStatus', 'integrityCheckedAt', 'size', 'onlineMissingSince'
       ]);
       
       let cleanedCount = 0;
@@ -700,11 +797,11 @@ const App: React.FC = () => {
 
   const executeResolveDuplicates = async () => {
       if (!exportPath || !integrityResult || integrityResult.duplicates.length === 0) return;
-      if (!confirm(`Soll eine automatische Bereinigung gestartet werden?`)) return;
+      if (!confirm(`Duplikat-Bereinigung starten?\n\nEs werden nur Offline-Kopien gelöscht (Einträge, die online nicht mehr gefunden wurden). Online vorhandene Google-Fotos bleiben immer erhalten.`)) return;
       
       addLog(`Löse ${integrityResult.duplicates.length} Duplikat-Gruppen auf...`, 'info');
       try {
-          const { deletedIds, count } = await DbUtils.resolveDuplicatesOnDisk(integrityResult.duplicates, dbRef.current.files, exportPath);
+          const { deletedIds, count, skippedOnlineGroups } = await DbUtils.resolveDuplicatesOnDisk(integrityResult.duplicates, dbRef.current.files, exportPath);
           for (const id of deletedIds) {
               delete dbRef.current.files[id];
               processedIdsRef.current.delete(id);
@@ -712,7 +809,7 @@ const App: React.FC = () => {
           await saveDatabase();
           setIntegrityResult(prev => prev ? ({...prev, duplicates: []}) : null);
           setShowIntegrityModal(false);
-          addLog(`Duplikat-Bereinigung fertig. ${count} gelöscht.`, 'success');
+          addLog(`Duplikat-Bereinigung fertig. ${count} gelöscht.${skippedOnlineGroups > 0 ? ` ${skippedOnlineGroups} Gruppen übersprungen (alle Einträge noch online).` : ''}`, 'success');
       } catch (e: any) {
           addLog("Fehler bei Duplikat-Lösung: " + e.message, 'error');
       }
@@ -777,6 +874,12 @@ const App: React.FC = () => {
       albumTargetPathRef.current = null;
       prevTrueMetaRef.current = null;
       newDownloadMetaRef.current.clear();
+      lastPanelSignatureRef.current = null;
+      panelRefreshedRef.current = false;
+      panelSyncedRef.current = true;
+      panelScrolledRef.current = false;
+      pendingInfoRef.current = null;
+      desyncAbortRef.current = false;
       
       // 4. Force Cleanup of Webview State if possible
       setIsInitialized(false);
@@ -809,19 +912,25 @@ const App: React.FC = () => {
           trusted
       });
 
-      const startPromise = new Promise<void>((resolve) => {
-          pendingStartResolvers.current.set(info.id, resolve);
+      // F3 (A1): Resolver meldet, OB der Download gestartet ist (verhindert Slot-Leak bei Timeout)
+      const startPromise = new Promise<boolean>((resolve) => {
+          pendingStartResolvers.current.set(info.id, () => resolve(true));
           setTimeout(() => {
               if (pendingStartResolvers.current.has(info.id)) {
                   console.error("Timeout waiting for download start:", info.id);
                   pendingStartResolvers.current.delete(info.id);
-                  resolve(); 
+                  resolve(false);
               }
           }, 15000);
       });
 
       await Crawler.triggerDownloadKeys(webviewRef.current);
-      await startPromise;
+      const started = await startPromise;
+
+      if (!started) {
+          addLog(`Download-Start fehlgeschlagen (Timeout): ${info.id}`, 'warning');
+          return; // keinen Slot belegen, ID nicht als verarbeitet markieren
+      }
       
       activeDownloadsRef.current += 1;
       setActiveDownloadsCount(activeDownloadsRef.current);
@@ -900,7 +1009,8 @@ const App: React.FC = () => {
       }
   };
 
-  const checkForOrphans = () => {
+  const checkForOrphans = async () => {
+      if (!exportPath) return;
       if (minDateEncountered.current === null || maxDateEncountered.current === null) return;
       const minTs = minDateEncountered.current;
       const maxTs = maxDateEncountered.current;
@@ -913,21 +1023,33 @@ const App: React.FC = () => {
       }
       
       addLog(`Prüfe Missing zwischen ${safeStart.toLocaleDateString()} und ${safeEnd.toLocaleDateString()}...`, 'info');
-      let markedCount = 0;
-      (Object.entries(dbRef.current.files) as [string, DatabaseEntry][]).forEach(([id, entry]) => {
-          if (entry.timestamp >= safeStart.getTime() && entry.timestamp < safeEnd.getTime()) {
-              if (!sessionSeenIds.current.has(id)) {
-                  if (!entry.missingSince) {
-                      entry.missingSince = Date.now();
-                      markedCount++;
-                      addLog(`Vermisst: ${entry.filename}`, 'error');
-                  }
-              }
+      let markedLocal = 0;
+      let markedOnline = 0;
+      const entries = Object.entries(dbRef.current.files) as [string, DatabaseEntry][];
+      for (const [id, entry] of entries) {
+          if (entry.timestamp < safeStart.getTime() || entry.timestamp >= safeEnd.getTime()) continue;
+          if (sessionSeenIds.current.has(id)) continue;
+          if (entry.missingSince || entry.onlineMissingSince) continue;
+
+          const exists = await window.electron.checkFileExists({
+              basePath: exportPath,
+              filename: entry.filename,
+              timestamp: entry.timestamp
+          });
+
+          if (!exists) {
+              entry.missingSince = Date.now();
+              markedLocal++;
+              addLog(`Vermisst (Datei fehlt lokal): ${entry.filename}`, 'error');
+          } else {
+              entry.onlineMissingSince = Date.now();
+              markedOnline++;
+              addLog(`Online nicht gefunden (Datei vorhanden): ${entry.filename}`, 'warning');
           }
-      });
-      if (markedCount > 0) {
-          updateOrphansList();
-          addLog(`${markedCount} Dateien als 'vermisst' markiert.`, 'error');
+      }
+      if (markedLocal > 0) updateOrphansList();
+      if (markedLocal > 0 || markedOnline > 0) {
+          addLog(`${markedLocal} Dateien lokal vermisst, ${markedOnline} online nicht gefunden.`, markedLocal > 0 ? 'error' : 'warning');
       } else {
           addLog("Alles synchron.", 'success');
       }
@@ -940,16 +1062,21 @@ const App: React.FC = () => {
       addLog("Sicherheits-Speicherung durchgeführt.", 'success');
   };
   
-  const finishBackupSession = () => {
+  const finishBackupSession = async (skipOrphans: boolean = false) => {
       if (isResettingRef.current) return;
 
-      checkForOrphans();
+      if (skipOrphans) {
+          addLog("Missing-Prüfung übersprungen (Session unvollständig/Desync).", 'warning');
+      } else {
+          await checkForOrphans();
+      }
       
       // Hinweis: Die "scannedRanges" Logik wurde hier entfernt, da wir jetzt pro Tag (scannedDays) speichern.
       // Die Aktualisierung der scannedDays passiert live in der Schleife bei Tageswechsel.
 
       if (dbFilePath && (processedIdsRef.current.size > 0 || minDateEncountered.current)) {
-          saveDatabase().then(() => addLog("Datenbank gespeichert.", 'success'));
+          await saveDatabase();
+          addLog("Datenbank gespeichert.", 'success');
       }
       
       setIsWalking(false); 
@@ -963,6 +1090,7 @@ const App: React.FC = () => {
   };
 
   const navigateAndVerifyChange = async (oldId: string): Promise<boolean> => {
+      if (desyncAbortRef.current) return false; // F1.3: nach Abbruch keine weitere Navigation
       await Crawler.navigateNext(webviewRef.current);
       
       // NEU: Sofort nach Navigation Video-Killer feuern
@@ -975,7 +1103,42 @@ const App: React.FC = () => {
           
           // Wir benutzen hier die lightweight-ID extraction ohne DOM-Scan
           const newId = await Crawler.extractIdFromUrl(webviewRef.current);
-          if (newId && newId !== oldId) return true; 
+          if (newId && newId !== oldId) {
+              // F1: Panel-Refresh abwarten (nur Haupt-Backup; Alben bleiben unverändert)
+              if (!isAlbumModeRef.current) {
+                  let changed = await waitForPanelRefresh(lastPanelSignatureRef.current);
+
+                  // F1.5a: Nutzer-Stop/Reset während des Waits ist KEIN Desync -> normal beenden
+                  if (!isWalkingRef.current) return false;
+
+                  // F1.3: Resync – Panel per prev/next zwingen, zum aktuellen Foto zu wechseln.
+                  // Nötig, wenn das Panel einen Schritt hinterherhängt (Refresh-Check allein reicht nicht).
+                  for (let resyncTry = 0; !changed && resyncTry < 2 && isWalkingRef.current; resyncTry++) {
+                      addLog(`Panel-Desync erkannt – Resync ${resyncTry + 1}/2...`, 'warning');
+                      await Crawler.navigatePrevious(webviewRef.current);
+                      await sleep(400);
+                      await Crawler.navigateNext(webviewRef.current);
+                      await Crawler.killVideoPlayers(webviewRef.current);
+                      await sleep(300);
+                      // F1.4: verifizieren, dass die Resync-Navigation wieder beim Zielfoto angekommen ist
+                      const resyncId = await Crawler.extractIdFromUrl(webviewRef.current);
+                      if (!resyncId || resyncId !== newId) {
+                          addLog(`Resync-Navigation verfehlt das Ziel (${resyncId || 'leer'} != ${newId}).`, 'warning');
+                      }
+                      changed = await waitForPanelRefresh(lastPanelSignatureRef.current);
+                  }
+
+                  if (!changed) {
+                      // F1.3: nicht behebbar -> Session abbrechen (keine Falschdaten)
+                      desyncAbortRef.current = true;
+                      addLog(`Session beendet: Panel-Desync nicht behebbar (Element ${oldId}) – bitte manuell prüfen.`, 'error');
+                      return false;
+                  }
+                  panelSyncedRef.current = true;
+                  panelRefreshedRef.current = true;
+              }
+              return true;
+          }
           retries++;
       }
       addLog("Navigation Timeout - Kein neues Bild gefunden.", 'error');
@@ -1018,6 +1181,12 @@ const App: React.FC = () => {
     isResettingRef.current = false;
     prevTrueMetaRef.current = null;
     newDownloadMetaRef.current.clear();
+    lastPanelSignatureRef.current = null;
+    panelRefreshedRef.current = false;
+    panelSyncedRef.current = true;
+    panelScrolledRef.current = false;
+    pendingInfoRef.current = null;
+    desyncAbortRef.current = false;
 
     if (isAlbumMode) {
       addLog(`[ALBUM] Starte separaten Album-Download nach ${albumTargetPathRef.current}...`, 'album');
@@ -1025,8 +1194,11 @@ const App: React.FC = () => {
       addLog('Starte Turbo-Backup (Parallel)...', 'info');
     }
 
-    await Crawler.toggleInfoPanel(webviewRef.current);
-    await sleep(1000);
+    // Panel-Toggle nur im Album-Modus (dort wird nicht gescraped)
+    if (isAlbumMode) {
+      await Crawler.toggleInfoPanel(webviewRef.current);
+      await sleep(1000);
+    }
 
     const targetPath = isAlbumMode ? albumTargetPathRef.current : exportPath;
     if (!targetPath) {
@@ -1034,6 +1206,39 @@ const App: React.FC = () => {
       isWalkingRef.current = false;
       setIsWalking(false);
       return;
+    }
+
+    // F1.4: Deterministischer Start – aktuelles Foto neu laden und Panel sicherstellen.
+    // Ersetzt den F1.3-Nudge (der das Panel einen Schritt hinterherließ und den Namens-Anker blockierte).
+    if (!isAlbumMode) {
+        const startId = await Crawler.extractIdFromUrl(webviewRef.current);
+        if (startId) {
+            addLog('Synchronisiere Startfoto (Panel-Refresh)...', 'debug');
+            try {
+                await webviewRef.current.loadURL(`https://photos.google.com/photo/${startId}`);
+            } catch (e) { /* best effort */ }
+            await sleep(1200);
+
+            // Panel-Öffnungs-Check (max. 3 Runden): sicherstellen, dass das Panel lesbar ist.
+            // Achtung: Bei null-Scrape (Seite lädt noch) NICHT togglen, sonst schließt man ein evtl. offenes Panel.
+            for (let panelTry = 0; panelTry < 3; panelTry++) {
+                const probe = await safeExtractInfo();
+                if (!probe) { await sleep(700); continue; }
+                const probeOk = !isNaN(parseGoogleDateString(probe.dateStr || '').getTime());
+                if (probeOk) break;
+                await Crawler.toggleInfoPanel(webviewRef.current);
+                await sleep(900);
+            }
+            const finalProbe = await safeExtractInfo();
+            const finalOk = !!finalProbe && !isNaN(parseGoogleDateString(finalProbe.dateStr || '').getTime());
+            addLog(`Panel beim Start ${finalOk ? 'synchronisiert' : 'nicht lesbar – fahre fort'} (${startId}).`, finalOk ? 'debug' : 'warning');
+        }
+    }
+
+    // F1: Erst-Synchronisierung – warten, bis das Panel stabil ist (kein Mid-Update-Scrape)
+    if (!isAlbumMode) {
+        const initialStable = await waitForPanelRefresh(null, 2000);
+        if (!initialStable) addLog('Panel bei Start nicht stabil – fahre trotzdem fort.', 'debug');
     }
 
     let consecutiveErrors = 0;
@@ -1068,33 +1273,69 @@ const App: React.FC = () => {
         if (!isWalkingRef.current) break;
 
         try {
+            panelScrolledRef.current = false; // F1.1: Panel-Scroll-Retry pro Foto einmal erlauben
+
             if (!isAlbumMode && Date.now() - lastSaveTime > 30000) {
                 await saveDatabase();
                 lastSaveTime = Date.now();
             }
 
+            // F1.3: Ein nicht behebbarer Desync bricht die Session ab (Flag wird post-loop ausgewertet)
+            if (desyncAbortRef.current) break;
+
             // --- 1. Metadaten lesen (mit Timeout) ---
-            let result: any = null;
+            // F1.2: Vom Panel-Refresh-Wait bestätigtes Ergebnis wiederverwenden (spart einen Vollscan).
+            let result: any = pendingInfoRef.current;
+            pendingInfoRef.current = null;
+            if (result && currentId && result.id !== currentId) {
+                addLog(`Pending-Panel verworfen (ID-Mismatch: ${result.id} != ${currentId})`, 'debug');
+                result = null;
+            }
+
+            const hasValidDate = (r: any) => !!(r && !isNaN(parseGoogleDateString(r.dateStr || "").getTime()));
             let attempts = 0;
-            
-            while (attempts < 5) { 
-                if (!isWalkingRef.current) break;
-                
-                result = await safeExtractInfo();
-                
-                const validDate = result && !isNaN(parseGoogleDateString(result.dateStr || "").getTime());
-                if (validDate) break;
-                
-                await sleep(500); 
-                attempts++;
+            if (!hasValidDate(result)) {
+                result = null;
+                while (attempts < 5) { 
+                    if (!isWalkingRef.current) break;
+                    
+                    result = await safeExtractInfo();
+                    
+                    if (hasValidDate(result)) break;
+                    
+                    await sleep(500); 
+                    attempts++;
+                }
             }
             
             if (!isWalkingRef.current) break;
 
-            const webDate = parseGoogleDateString(result?.dateStr || "");
-            const webTimestamp = webDate.getTime();
+            let webDate = parseGoogleDateString(result?.dateStr || "");
+            let webTimestamp = webDate.getTime();
 
             // --- 2. Fehlerbehandlung (Datum nicht lesbar) ---
+            if (isNaN(webTimestamp)) {
+                // F1.1a: Diagnose – welcher Panel-Text lag vor?
+                const panelSnippet = (result?.dateStr || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+                addLog(`Diagnose Datum nicht lesbar: id=${currentId} result=${result ? 'ok' : 'null'} panel="${panelSnippet}"`, 'debug');
+
+                // F1.1b: Einmalig rechtes Panel nach unten scrollen und neu scrapen
+                // (Details/Datum liegt bei manchen Fotos unterhalb des sichtbaren Bereichs)
+                if (!panelScrolledRef.current) {
+                    panelScrolledRef.current = true;
+                    await Crawler.scrollSidePanelToBottom(webviewRef.current);
+                    await sleep(300);
+                    const rescrape = await safeExtractInfo();
+                    const rescrapeDate = parseGoogleDateString(rescrape?.dateStr || "");
+                    if (!isNaN(rescrapeDate.getTime())) {
+                        result = rescrape;
+                        webDate = rescrapeDate;
+                        webTimestamp = webDate.getTime();
+                        addLog(`Panel-Scroll lieferte Datum: ${webDate.toLocaleString()}`, 'debug');
+                    }
+                }
+            }
+
             if (isNaN(webTimestamp)) {
                 consecutiveErrors++;
                 addLog(`Datum nicht lesbar für ${currentId}. Versuche Reload (L/R)...`, 'warning');
@@ -1110,12 +1351,21 @@ const App: React.FC = () => {
                 
                 if (consecutiveErrors >= 3) {
                     addLog("Trotz Reload keine Daten. Überspringe Bild...", 'error');
-                    const changed = await navigateAndVerifyChange(currentId);
+                    let changed = await navigateAndVerifyChange(currentId);
+                    // F1.1c: Navigation wiederholen – Focus/UI kann kurzzeitig blockieren
+                    for (let navTry = 0; !changed && navTry < 2 && isWalkingRef.current && !desyncAbortRef.current; navTry++) {
+                        addLog(`Navigation blockiert – Wiederholung ${navTry + 1}/2...`, 'warning');
+                        await sleep(1500);
+                        changed = await navigateAndVerifyChange(currentId);
+                    }
                     if (changed) { 
                         currentId = await Crawler.extractIdFromUrl(webviewRef.current); 
                         consecutiveErrors = 0; 
                         continue; 
                     } else { 
+                        if (!desyncAbortRef.current) {
+                            addLog(`Session beendet: Element ${currentId} blockiert die Navigation – bitte manuell prüfen.`, 'error');
+                        }
                         break; 
                     } 
                 }
@@ -1123,6 +1373,9 @@ const App: React.FC = () => {
             }
             
             consecutiveErrors = 0;
+            if (!isAlbumMode && result?.panelSignature) {
+                lastPanelSignatureRef.current = result.panelSignature;
+            }
 
             // NEU: Tageswechsel-Erkennung & Scan-Log (nur im Hauptbackup)
             const currentDayIdentifier = getIsoDateString(webDate);
@@ -1173,13 +1426,19 @@ const App: React.FC = () => {
                             needsDownload = true;
                         } else {
                             let metaUpdated = false;
-                            const trustInfo = evaluateScrapeTrust(result, webTimestamp, existingEntry);
+                            const trustInfo = evaluateScrapeTrust(panelRefreshedRef.current, result, webTimestamp, existingEntry);
                             trustedForPhoto = trustInfo.trusted;
+                            addLog(`Trust: refreshed=${panelRefreshedRef.current} synced=${panelSyncedRef.current} reason=${trustInfo.reason || '-'} id=${result.id}`, 'debug');
 
                             if (existingEntry.missingSince) {
                                  delete existingEntry.missingSince; 
                                  metaUpdated = true;
                                  addLog(`✅ Status korrigiert: ${existingEntry.filename} wiedergefunden.`, 'success');
+                            }
+                            if (existingEntry.onlineMissingSince) {
+                                 delete existingEntry.onlineMissingSince;
+                                 metaUpdated = true;
+                                 addLog(`✅ Status korrigiert: ${existingEntry.filename} wieder online gesehen.`, 'success');
                             }
 
                             if (result.potentialFilename && (!existingEntry.originalName || existingEntry.originalName !== result.potentialFilename)) {
@@ -1255,7 +1514,9 @@ const App: React.FC = () => {
 
             if (needsDownload) {
                 if (!isAlbumMode) {
-                    trustedForPhoto = evaluateScrapeTrust(result, webTimestamp, dbRef.current.files[result.id]).trusted;
+                    const trustInfo = evaluateScrapeTrust(panelRefreshedRef.current, result, webTimestamp, dbRef.current.files[result.id]);
+                    trustedForPhoto = trustInfo.trusted;
+                    addLog(`Trust: refreshed=${panelRefreshedRef.current} synced=${panelSyncedRef.current} reason=${trustInfo.reason || '-'} id=${result.id}`, 'debug');
                 }
                 await initiateDownloadAsync(result, targetPath, isAlbumMode, trustedForPhoto);
             }
@@ -1280,7 +1541,12 @@ const App: React.FC = () => {
             await sleep(2000);
             if (!isWalkingRef.current) break;
             const changed = await navigateAndVerifyChange(currentId);
-            if(changed) currentId = await Crawler.extractIdFromUrl(webviewRef.current);
+            if (changed) {
+                currentId = await Crawler.extractIdFromUrl(webviewRef.current);
+            } else {
+                addLog(`Session beendet: Ausnahme und Navigation blockiert – bitte manuell prüfen.`, 'error');
+                break;
+            }
         }
     }
     
@@ -1299,7 +1565,7 @@ const App: React.FC = () => {
         addLog('[ALBUM] Album-Download beendet.', 'album');
         pendingStartResolvers.current.clear();
     } else {
-        finishBackupSession();
+        await finishBackupSession(desyncAbortRef.current);
     }
   };
 

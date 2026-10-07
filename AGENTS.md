@@ -65,7 +65,7 @@ types.ts                     Alle TS-Typen inkl. window.electron-Interface (IPC-
 index.html                   HTML-Shell, Tailwind-CDN, Importmap, Custom-Scrollbar-Styles
 index.tsx                    React-Bootstrap (createRoot)
 declarations.d.ts            Modul-/JSX-Deklarationen (webview, *.png, piexifjs)
-logic/crawlerActions.ts      DOM-Steuerung im Webview (Tastatur-Events, Metadaten-Scraping)
+logic/crawlerActions.ts      DOM-Steuerung im Webview (Tastatur-Events, Metadaten-Scraping, Panel-Scroll)
 logic/databaseUtils.ts       CSV-Export, Duplikat-Auflösung
 utils/exifUtils.ts           Datums-Parser (Google-Sidebar-Texte, EXIF), ISO-Datums-Helfer
 components/StartupScreen.tsx     Startbildschirm (DB laden/neu anlegen)
@@ -96,29 +96,30 @@ dist/, release/              Build-Artefakte (via .gitignore ausgeschlossen)
    - `/album/` oder `/share/` → öffnet stattdessen den **AlbumDownloadModal**.
    - sonst: `/photo/` muss enthalten sein, sonst Fehler „Bitte öffne zuerst ein Bild!“.
 3. `runBackupSession(false)` startet den Loop:
-   - Infopanel per `i` umschalten (`toggleInfoPanel`), 1 s warten.
+   - **F1.4-Start:** Aktuelles Foto per `loadURL` neu laden, ~1,2 s warten, Panel-Öffnungs-Check (falls nötig `i`, max. 3 Runden; bei `null`-Scrape nicht togglen), dann initiale Panel-Stabilisierung. (Album-Modus: weiterhin nur `toggleInfoPanel` + 1 s.)
    - Schleifenbedingung: `isWalkingRef.current === true`.
    - **Parallelitätsgrenze:** max. 5 aktive Downloads (`activeDownloadsRef >= 5` → 500 ms warten).
    - **Batch-Limit 1000:** Nach 1000 Loop-Iterationen auf alle Downloads warten, DB speichern, 1,5 s Pause (Sicherheitscheckpoint).
    - **Autosave:** alle 30 s `saveDatabase()` (nur Haupt-Backup, nicht Album).
 4. Pro Iteration:
    a. `safeExtractInfo()` (mit 3-s-Timeout) liest Bild-ID (aus URL) + Sidepanel-Text (Datum + evtl. Dateiname). Bis zu 5 Versuche à 500 ms, wenn kein valides Datum.
-   b. Datum via `parseGoogleDateString(webDate)`; bei NaN → `navigatePrevious` + `navigateNext` + `killVideoPlayers` + Reload-Versuche; nach 3 Fehlern in Folge wird das Bild übersprungen.
+   b. Datum via `parseGoogleDateString(webDate)`; bei NaN (F1.1): Diagnose-Log mit rohem Panel-Text, einmaliger `scrollSidePanelToBottom`-Versuch + Re-Scrape, dann `navigatePrevious` + `navigateNext` + `killVideoPlayers` + Reload-Versuche; nach 3 Fehlern in Folge wird das Bild übersprungen. Schlägt auch die Navigation fehl, wird sie 2× wiederholt; danach Abbruch mit eindeutiger Meldung „Session beendet: Element `<id>` blockiert die Navigation".
    c. **Tageswechsel-Erkennung:** ändert sich `getIsoDateString(webDate)` gegenüber `lastDayIdentifier`, wird der **vorherige, volle Tag** in `db.scannedDays[YYYY-MM-DD] = Date.now()` eingetragen (der erste Tag einer Session wird absichtlich ausgelassen, weil er evtl. unvollständig gescannt wurde). Dabei wird `batchCounter` zurückgesetzt und die DB gespeichert.
    d. `updateRangeTracking(webTimestamp)` aktualisiert Min/Max-Datum der Session; `sessionSeenIds.add(id)`.
    e. **Download-Entscheidung (nur Haupt-Backup):**
       - ID unbekannt → Download.
       - ID bekannt, Datei fehlt physisch (`check-file-exists`) → Download + Warnlog.
       - ID bekannt, Datei existiert → **kein Download**, aber Metadaten-Abgleich:
-        * `missingSince` löschen (wiedergefunden).
+        * `missingSince` löschen (lokal wiedergefunden).
+        * `onlineMissingSince` löschen (wieder online gesehen).
         * `originalName` aus Panel-Filename aktualisieren (nur wenn „trusted“, siehe Abschnitt 9).
         * Weicht `entry.timestamp` um > 60 s vom Web-Datum ab → Datei verschieben/umschreiben via `moveAndUpdateFile` – **nur mit Hash-Gate** (siehe 6.3). Ohne gespeicherten Hash wird dieser erst nachgetragen und die Korrektur auf den nächsten Lauf verschoben.
         * `scannedAt = Date.now()`.
-   f. **Download anstoßen** (`initiateDownloadAsync`): `prepareDownload(config)` → `triggerDownloadKeys(webview)` (simuliert **Shift+D**) → warten auf `download-started`-Event (max. 15 s Timeout) → ID zu `processedIdsRef` hinzufügen, `activeDownloads` erhöhen.
-   g. **Navigation:** `navigateNext` (ArrowRight) + `killVideoPlayers`, dann bis zu 30× à 200 ms prüfen, ob die URL-ID wechselt (`navigateAndVerifyChange`). Kein Wechsel nach 6 s → Loop bricht ab (vermutlich Bibliotheksende).
+   f. **Download anstoßen** (`initiateDownloadAsync`): `prepareDownload(config)` → `triggerDownloadKeys(webview)` (simuliert **Shift+D**) → warten auf `download-started`-Event (max. 15 s Timeout). Nur bei echtem Start: `activeDownloads` erhöhen + ID zu `processedIdsRef` hinzufügen; bei Timeout Warnlog und **kein** Slot belegen (F3, verhindert Slot-Leak).
+   g. **Navigation:** `navigateNext` (ArrowRight) + `killVideoPlayers`, dann bis zu 30× à 200 ms prüfen, ob die URL-ID wechselt (`navigateAndVerifyChange`). Anschließend wartet `waitForPanelRefresh` (F1, 150 ms-Poll, max. 3 s) darauf, dass das Info-Panel zum neuen Foto wechselt (F1.3-Namens-Anker gegen Ein-Schritt-Lag). Bei Nicht-Erfolg: bis zu 2 Resyncs (prev/next); bleibt es stale → Session-Abbruch (F1.3). Kein ID-Wechsel nach 6 s → Loop bricht ab (vermutlich Bibliotheksende).
 5. Nach dem Loop: auf alle aktiven Downloads warten.
 6. `finishBackupSession()` (nur Haupt-Backup): `checkForOrphans()` + DB speichern + Log „Backup-Vorgang beendet.“
-   - `checkForOrphans`: markiert DB-Einträge, deren `timestamp` in **kompletten gescannten Tagen** liegt (safeStart = Min-Datum + 1 Tag um 00:00, safeEnd = Max-Datum um 00:00) und deren ID nicht in `sessionSeenIds` ist, mit `missingSince`.
+   - `checkForOrphans` (F2): prüft DB-Einträge, deren `timestamp` in **kompletten gescannten Tagen** liegt (safeStart = Min-Datum + 1 Tag um 00:00, safeEnd = Max-Datum um 00:00) und deren ID nicht in `sessionSeenIds` ist. Existiert die Datei lokal nicht → `missingSince`; existiert sie lokal, wurde aber online nicht gesehen → `onlineMissingSince` (Warnlog). Bereits markierte Einträge werden übersprungen.
 7. „⏹ Stop“ setzt `isWalkingRef=false` und speichert sicherheitshalber.
 
 ### 4.3 Einzel-Download („⬇ 1“)
@@ -145,7 +146,7 @@ dist/, release/              Build-Artefakte (via .gitignore ausgeschlossen)
 - **Dateinamen-Sanitizing:**
   - Endung wird **case-insensitiv** abgetrennt und in Kleinbuchstaben normalisiert (`.MP4` → `.mp4`).
   - Basisname auf **100 Zeichen** gekürzt (Google liefert teils Beschreibungen als Namen).
-  - Kollisionen im Zielordner: `Name (1).ext`, `Name (2).ext`, … (Zähler-Schleife, `fs.existsSync`).
+  - Kollisionen im Zielordner: `Name (1).ext`, `Name (2).ext`, … (Zähler-Schleife, `fs.existsSync` **und** `reservedTargetPaths`-Set, F5). Das Set reserviert gewählte Pfade, solange der Download läuft (Datei existiert erst nach `setSavePath`/Downloadstart), und wird im `done`-Handler wieder freigegeben → parallele Gleichnamige können sich nicht überschreiben. Auch die ZIP-Extraktion nutzt die Reservierung.
 - Log-Einträge: Download-Start mit id/Datei/Ordner/Web-Datum/trusted; Abschluss mit Source-/File-Hash-Prefix.
 
 ### 5.2 ZIP-Handling (Live Photos)
@@ -189,7 +190,8 @@ dist/, release/              Build-Artefakte (via .gitignore ausgeschlossen)
       "hash": "…",                      // SHA-256 der Datei auf der Platte
       "sourceHash": "…",                // SHA-256 des Rohdownloads
       "size": 123456,                   // Bytes (durch Struktur-Check befüllt)
-      "missingSince": 0,                // Timestamp, gesetzt wenn Datei nicht gefunden
+      "missingSince": 0,                // Timestamp, gesetzt wenn Datei lokal nicht gefunden
+      "onlineMissingSince": 0,          // Timestamp, gesetzt wenn online nicht gesehen (Datei lokal vorhanden)
       "integrityStatus": "ok|corrupt",  // undefined = ungeprüft
       "integrityCheckedAt": 0
     }
@@ -244,9 +246,7 @@ Schreibt `YYYY:MM:DD HH:MM:SS` in:
 - Prüft für jede DB-Datei, ob `<basePath>/<YYYY>/<MM>/<filename>` existiert → `missing`.
 - Sammelt `sizeUpdates` (Dateigröße in Bytes) und, falls kein Hash vorhanden, berechnet er Hashes → `updates`.
 - Mit `onlySubset=true` werden Hashes für Dateien mit `integrityStatus === 'ok'` und vorhandenem Hash übersprungen (Performanz).
-- **Duplikaterkennung:**
-  1. Hash-basiert über alle validen Dateien.
-  2. Heuristisch: Dateien mit Muster `Name (n).ext`, deren Basisdatei `Name.ext` im selben Monatsordner existiert und **gleiche Größe ± 2 s mtime** hat → künstliche Duplikatgruppe (`HEURISTIC_…`).
+- **Duplikaterkennung (F6):** ausschließlich **hash-basiert** über alle validen Dateien. Die frühere Dateinamen-Heuristik (`Name (n).ext` + gleiche Größe ± 2 s mtime) wurde entfernt, weil sie legitime, online vorhandene Google-Fotos mit gleichem Namen fälschlich als Duplikate markiert hat (Re-Download-Zyklus).
 - Ergebnis wird im Frontend in die DB übernommen (Hashes, Größen), `missing` sofort als `missingSince` markiert, dann DB-Speichern.
 
 ### 8.2 Inhalts-Check / Deep Scan (IPC `verify-file-integrity-batch` / „💾 Inhalt prüfen“)
@@ -260,6 +260,7 @@ Schreibt `YYYY:MM:DD HH:MM:SS` in:
 ### 8.3 Korrektur-Modal
 - **Vermisste Dateien (Orphans):** aus DB löschen (Cleanup) oder „Status zurücksetzen“ (ignorieren) oder „🌐 Web öffnen“ (`https://photos.google.com/photo/<id>` im Webview → Nutzer kann manuell neu herunterladen; Modal schließt).
 - **Defekte Dateien:** „Löschen“ entfernt die Datei **physisch**, der DB-Eintrag bleibt bewusst bestehen (ohne `integrityStatus`/`hash`) → beim nächsten Backup wird sie neu geladen. „Alle von Festplatte löschen“ als Batch.
+- **`onlineMissingSince`** (F2) wird derzeit nur im Log/DB geführt; Anzeige im Modal folgt in der UI-Phase.
 
 ### 8.4 Namensbereinigung (IPC `find-renamable-files` / „✨ Dateinamen bereinigen“)
 - Kandidaten sind Dateien mit Muster `Name (n).ext`, bei denen:
@@ -275,15 +276,20 @@ Schreibt `YYYY:MM:DD HH:MM:SS` in:
 ### 8.5 CSV-Export („📄 Excel CSV Export“)
 - Datei: `<DB-Ordner>/gphotos_export_YYYY-MM-DD.csv`.
 - **UTF-8 mit BOM** (`\uFEFF`), Trennzeichen **Semikolon**, Felder in Anführungszeichen (`"` wird verdoppelt), sortiert nach `timestamp` absteigend.
-- Spalten: ID; Filename; Original Name; Web Date (Readable); Timestamp; Original Date; Hash; Source Hash; Integrity Status (Nicht geprüft/OK/Defekt); Saved At; Downloaded At; Scanned At; Missing Since.
+- Spalten: ID; Filename; Original Name; Web Date (Readable); Timestamp; Original Date; Hash; Source Hash; Integrity Status (Nicht geprüft/OK/Defekt); Saved At; Downloaded At; Scanned At; Missing Since; Online Missing Since.
 
 ### 8.6 Legacy-Bereinigung („Bereinigen“ im Struktur-Bericht)
 - Entfernt `scannedRanges` (Root) und alle unbekannten Felder aus `files`-Einträgen. Gültige Keys (müssen synchron gehalten werden!):
-  `filename, timestamp, originalDate, originalName, savedAt, downloadedAt, scannedAt, hash, sourceHash, missingSince, id, integrityStatus, integrityCheckedAt, size`.
+  `filename, timestamp, originalDate, originalName, savedAt, downloadedAt, scannedAt, hash, sourceHash, missingSince, onlineMissingSince, id, integrityStatus, integrityCheckedAt, size`.
 - Die gleiche Key-Liste existiert **doppelt**: in `App.tsx` (`executeCleanLegacy`) und in `components/ActionModals.tsx` (Legacy-Zählung). **Bei Schema-Änderungen beide Stellen anpassen!**
 
-### 8.7 Duplikate auflösen
-- `resolveDuplicatesOnDisk` (logic/databaseUtils.ts): pro Duplikatgruppe gewinnt die Datei mit dem **kürzesten Dateinamen**, bei Gleichstand die **älteste** (`timestamp`). Alle anderen werden physisch gelöscht und aus der DB entfernt.
+### 8.7 Duplikate auflösen (F6 / Variante A)
+- `resolveDuplicatesOnDisk` (logic/databaseUtils.ts) arbeitet nur noch auf Hash-Duplikatgruppen:
+  - Einträge, die **noch online vorhanden** sind (kein `missingSince`/`onlineMissingSince`), werden **nie** gelöscht.
+  - Enthält die Gruppe Online-Einträge: alle **Offline-Kopien** werden physisch gelöscht und aus der DB entfernt.
+  - Enthält sie nur Offline-Einträge: der **beste** bleibt (kürzester Dateiname, bei Gleichstand ältestes `timestamp`), der Rest wird gelöscht.
+  - Gruppen, in denen nichts gelöscht werden darf (alle online), werden übersprungen und gezählt (`skippedOnlineGroups`).
+- Damit bleiben mehrere Google-Fotos mit gleichem Namen/Inhalt erhalten, solange sie online existieren; der frühere Lösch-/Re-Download-Zyklus ist beseitigt.
 
 ### 8.8 Scan-Heatmap
 - `scannedDays` (Tag → Scan-Zeitpunkt) + DB-Dateien werden pro Kalenderjahr als GitHub-Style-Grid gerendert.
@@ -294,17 +300,39 @@ Schreibt `YYYY:MM:DD HH:MM:SS` in:
 
 ## 9. Trust-/Stale-Panel-Mechanik (wichtig, leicht zu brechen!)
 
-Google Photos aktualisiert das Info-Sidepanel asynchron verzögert beim Navigieren. Dadurch kann der Scraper **Metadaten des Vorgängerfotos** lesen.
+Google Photos aktualisiert das Info-Sidepanel asynchron verzögert beim Navigieren. Dadurch kann der Scraper **Metadaten des Vorgängerfotos** lesen. Seit F1 gibt es dafür zwei Mechanismen: den **Panel-Refresh-Wait** (primär) und den **Trust-Detektor** (Fallback).
 
-- `prevTrueMetaRef` merkt sich das zuletzt verlässlich gescannte Foto (`id`, `filename`, `originalDate`, `webTimestamp`). `newDownloadMetaRef` puffert Downloads der Session.
-- `evaluateScrapeTrust(result, webTimestamp, entry)`:
+### 9.1 Panel-Refresh-Wait (F1)
+
+- `extractCurrentImageInfo` liefert wieder eine `panelSignature` (Sidebar-Texte + Anzahl + `potentialFilename`). Erfasst seit F1.1 zusätzlich die Tags `H4`, `BUTTON`, `A`, `LI`, `TD`, `LABEL` (Datums-/Detailzeilen sind teils klickbar).
+- `scrollSidePanelToBottom` (F1.1): scrollt das größte scrollbare Element rechts (>70 % Viewportbreite) ans Ende, damit lazy/virtualisierte Details gerendert werden. Wird nur im Fehlerpfad „Datum nicht lesbar" einmal pro Foto aufgerufen; `panelScrolledRef` steuert die Einmaligkeit.
+- `waitForPanelRefresh(prevSignature, timeoutMs=3000)` in App.tsx: pollt alle **150 ms**; „refreshed" = Signatur ≠ Vorgänger **und** bei zwei aufeinanderfolgenden Reads stabil. `prevSignature === null` = nur Stabilität (Erst-Synchronisierung). Respektiert `isWalkingRef` (Stop/Reset).
+- **F1.3-Namens-Anker:** Eine Probe gilt als „noch Vorgängerfoto", wenn ihr `potentialFilename` (ohne Kollisions-Suffix `(n)`, case-insensitiv) dem zuletzt verarbeiteten Dateinamen entspricht → wird **nicht** akzeptiert, weiter gepollt. Verhindert den Ein-Schritt-Lag („Panel ändert sich" ≠ „Panel gehört zur aktuellen URL").
+- Nach jeder Navigation (`navigateAndVerifyChange`) wird der Refresh abgewartet:
+  - Erfolg → `panelRefreshedRef=true` (Trust-Beweis für das nächste Foto), `panelSyncedRef=true`.
+  - **F1.3-Resync:** Bei Nicht-Erfolg bis zu 2× `navigatePrevious` + 400 ms + `navigateNext` + 300 ms + erneuter Wait (zwingt Google, das Panel für das aktuelle Foto neu zu rendern).
+  - **F1.3-Abbruch:** Bleibt es stale → `desyncAbortRef=true`, Log `Session beendet: Panel-Desync nicht behebbar (Element <id>) – bitte manuell prüfen.`; die Schleife bricht ab, die DB wird gespeichert, die **Missing-/Orphan-Prüfung wird übersprungen** (`finishBackupSession(skipOrphans=true)`), da die Session unvollständig ist.
+  - **F1.5a-Stop-Abgrenzung:** Wird während des Waits gestoppt/resettet (`isWalkingRef=false`), wird **kein** Desync gemeldet und kein Abbruch-Flag gesetzt – der Scan endet normal (Missing-Prüfung läuft).
+- **Deterministischer Session-Start (F1.4):** Der F1.3-Nudge (prev/next) wurde entfernt – er hinterließ das Panel einen Schritt zurück und blockierte den Namens-Anker (Sackgasse). Stattdessen: aktuelle Foto-ID merken → `loadURL('https://photos.google.com/photo/<id>')` (frisches Panel) → 1,2 s warten → **Panel-Öffnungs-Check** (max. 3 Runden; bei `null`-Scrape NICHT togglen, sonst schließt man ein offenes Panel) → initiale Panel-Stabilisierung (2 s). Log: `Panel beim Start synchronisiert|nicht lesbar`. Der Resync verifiziert seit F1.4 zusätzlich die URL (`resyncId === newId`), und bei Wait-Timeout wird die letzte Probe als Debug-Zeile geloggt (`Panel-Wait-Timeout: name=… dateOk=… texts=… sig=…`).
+- **Album-Modus überspringt Wait/Nudge komplett** (unverändert schnell; Trust ist dort irrelevant).
+- **F1.2-Rückbau (Vollscan wieder aktiv):** Der frühere Teilscan über einen gecachten Panel-Container (`window.__rlePanelRoot`) wurde entfernt – er lieferte nach Navigationen veraltete (versteckte) Panel-Inhalte und führte zum Desync-Abbruch. `extractCurrentImageInfo` scannt wieder die gesamte Seite (Elemente rechts >70 % Viewportbreite), inkl. erweiterter Tag-Liste (`H4`, `BUTTON`, `A`, `LI`, `TD`, `LABEL`). **Beibehalten:** `pendingInfoRef` – das vom Wait per zweitem Read bestätigte Ergebnis wird in der nächsten Iteration statt eines redundanten dritten Scans verwendet (ID-Abgleich mit `currentId`; bei Mismatch verworfen).
+
+### 9.2 Trust-Detektor (`evaluateScrapeTrust(panelRefreshed, result, webTimestamp, entry)`)
+
+- **Harte Namenssperre (immer):** `potentialFilename` == Vorgängername und ≠ eigener Name (`filename`/`originalName`) → `trusted=false` („Kandidat entspricht Vorgängername"). Schützt auch bei bestätigtem Refresh vor Teil-Updates.
+- **`panelRefreshed`** → `trusted=true` (60-s-Heuristik wird umgangen).
+- **Fallback (Timeout/erste Iteration):**
   - Kein Vorgänger → vertrauenswürdig.
-  - Vorgänger-Datum (EXIF oder Web) bzw. `filename` vergleichen: Match innerhalb 60 s oder gleicher Name (`potentialFilename`).
-  - Wenn es dem Vorgänger ähnelt, **aber nicht zum eigenen DB-Eintrag passt** → `trusted=false` („Panel zeigt vermutlich Vorgängerfoto“).
-- Konsequenzen bei `trusted=false`:
-  - Download läuft trotzdem, aber **`trusted=false` im Download-Config** → Main-Prozess schreibt **keine** Metadaten (EXIF/Video/FS), `metadataWritten=false`.
-  - Namens-/Datums-Korrekturen werden mit Warnlog übersprungen.
-  - `rememberTrueMeta` speichert den Web-Timestamp dann nicht als verlässlich.
+  - Vorgänger-Datum (EXIF oder Web) bzw. `filename` vergleichen: Match innerhalb 60 s oder gleicher Name.
+  - Zusätzlich `matchesOwn` gegen `entry.timestamp`, wenn kein EXIF-Datum vorliegt.
+  - Unvollständige Vorgänger-Referenz → **`trusted=true`** statt untrusted (verhindert die frühere Untrusted-Kaskade).
+- Debug-Log pro Foto: `Trust: refreshed=… synced=… reason=… id=…` (Typ `debug`, nur Konsole/Logdatei).
+
+### 9.3 Konsequenzen bei `trusted=false`
+
+- Download läuft trotzdem, aber **`trusted=false` im Download-Config** → Main-Prozess schreibt **keine** Metadaten (EXIF/Video/FS), `metadataWritten=false`.
+- Namens-/Datums-Korrekturen werden mit Warnlog übersprungen.
+- `rememberTrueMeta` speichert den Web-Timestamp dann nicht als verlässlich.
 - `handleSingleDownload` nutzt diesen Detektor **nicht** (immer `trusted=true`).
 
 ---
@@ -349,7 +377,7 @@ Alle Kanalnamen exakt so (main.cjs `ipcMain`):
 | `showItemInFolder` | `show-item-in-folder` | invoke | Explorer |
 
 - Die TS-Typisierung liegt in `types.ts` im `declare global { interface Window { electron: … } }`. **Neue IPC-Funktionen immer an drei Stellen ergänzen: `main.cjs` (Handler), `preload.cjs` (Bridge), `types.ts` (Typ).**
-- `checkIntegrity` wird in der Typisierung noch mit `(basePath, files)` beschrieben, tatsächlich ruft App.tsx `(basePath, files, onlySubset)` mit `@ts-ignore`. Bei Gelegenheit Typisierung nachziehen.
+- `checkIntegrity` ist als `(basePath, files, onlySubset?)` typisiert (F9); der frühere `@ts-ignore` ist entfernt.
 
 ---
 
@@ -390,7 +418,7 @@ Alle Kanalnamen exakt so (main.cjs `ipcMain`):
 
 Diese Punkte sind bewusst dokumentiert, damit Agenten sie nicht für funktionierenden Code halten:
 
-1. **Toter Code wurde in Cleanup-Phase 1 entfernt:** `services/googlePhotosService.ts` (Library-API), IPC `google-api-request` + `create-directory`, `deleteOrphansFromDisk`, `determineAlbumName`, `formatDateForExif`, `blobToDataURL`, `dataURLtoBlob`, `AppState`, `GooglePhotoAlbum`, `GoogleMediaItem`, `foundInSidePanel`/`panelSignature`, unbenutzte Imports, `public/index.css`, `metadata.json`. Nicht wieder einführen.
+1. **Toter Code wurde in Cleanup-Phase 1 entfernt:** `services/googlePhotosService.ts` (Library-API), IPC `google-api-request` + `create-directory`, `deleteOrphansFromDisk`, `determineAlbumName`, `formatDateForExif`, `blobToDataURL`, `dataURLtoBlob`, `AppState`, `GooglePhotoAlbum`, `GoogleMediaItem`, `foundInSidePanel`, unbenutzte Imports, `public/index.css`, `metadata.json`. Nicht wieder einführen. **Ausnahme:** `panelSignature` wurde in F1 bewusst wieder eingebaut und ist jetzt aktiv (Abschnitt 9.1).
 2. **`scannedRanges`** ist Legacy (Root-Feld). Nur noch für Migration/Bereinigung relevant.
 3. **Doppelte Valid-Key-Listen** für die Legacy-Bereinigung (App.tsx + ActionModals.tsx) – synchron halten!
 4. **`basePath` wird beim Speichern auf `"."` gesetzt** – der echte Basispfad kommt beim Laden aus dem Dateipfad. Nicht „korrigieren“, das ist Absicht (portable DB).
@@ -407,16 +435,18 @@ Diese Punkte sind bewusst dokumentiert, damit Agenten sie nicht für funktionier
 
 | # | Prio | Problem | Ort |
 |---|---|---|---|
-| A1 | kritisch | Download-Slot-Leak: Bei `download-started`-Timeout wird trotzdem `activeDownloadsRef++` + `processedIdsRef.add()` ausgeführt, ohne dass je ein `download-complete` folgt → nach 5 Timeouts hängt die Schleife dauerhaft | App.tsx `initiateDownloadAsync` |
-| A2 | kritisch | Endlosschleife im `catch` der Backup-Schleife: fehlendes `break`, wenn `navigateAndVerifyChange` nach einer Exception scheitert (normaler Pfad bricht ab) | App.tsx `runBackupSession` |
-| A3 | mittel | Trust-Detektor: `matchesOwn` prüft nur `entry.originalDate`, nicht `entry.timestamp` → Minuten-Bursts ohne EXIF-Datum werden dauerhaft `trusted=false` (Metadaten/Korrekturen übersprungen) | App.tsx `evaluateScrapeTrust` |
-| A4 | mittel | Namenskollisions-Race: `(n)`-Prüfung via `existsSync` vor physischer Dateierstellung; parallele Gleichnamige können denselben Zielpfad erhalten → Overwrite | main.cjs `will-download` |
-| A5 | klein | `deleteFile`-Rückgabewert in Korrektur-Pfaden wird ignoriert; bei fehlgeschlagenem physischem Löschen werden trotzdem `hash`/`integrityStatus` entfernt | App.tsx `handleRemoveCorruptFile`/`executeDeleteAllCorrupt` |
-| A6 | klein | `dbFilePath` wird in die DB-JSON persistiert (absoluter Altpfad) | App.tsx `saveDatabase` |
+| A1 | kritisch | ~~Download-Slot-Leak: Bei `download-started`-Timeout wird trotzdem `activeDownloadsRef++` + `processedIdsRef.add()` ausgeführt~~ **behoben in F3**: Resolver liefert `boolean`; nur bei echtem Start wird der Slot belegt. Offen: keine automatischen Retries im Timeout-Fall (nächster Lauf holt das Foto nach) | App.tsx `initiateDownloadAsync` |
+| A2 | kritisch | ~~Endlosschleife im `catch` der Backup-Schleife: fehlendes `break`, wenn `navigateAndVerifyChange` nach einer Exception scheitert~~ **behoben in F4**: bei fehlgeschlagener Navigation bricht der `catch` mit eindeutiger Meldung ab | App.tsx `runBackupSession` |
+| A3 | mittel | ~~Trust-Detektor: `matchesOwn` prüft nur `entry.originalDate` → Minuten-Bursts dauerhaft `trusted=false`~~ **behoben in F1** (Panel-Refresh-Wait, `entry.timestamp`-Fallback, Kaskaden-Fix, harte Namenssperre). Offen bleibt die Datenpflege der bereits korrupten `originalName`-Altfälle (s. Analyse) | App.tsx `evaluateScrapeTrust` |
+| A4 | mittel | ~~Namenskollisions-Race: `(n)`-Prüfung via `existsSync` vor physischer Dateierstellung; parallele Gleichnamige können denselben Zielpfad erhalten → Overwrite~~ **behoben in F5**: `reservedTargetPaths`-Set reserviert Zielpfade bis zum Download-Ende | main.cjs `will-download` |
+| A5 | klein | ~~`deleteFile`-Rückgabewert in Korrektur-Pfaden wird ignoriert~~ **behoben in F7**: DB-Reset nur bei erfolgreichem physischem Löschen, sonst Warnlog | App.tsx `handleRemoveCorruptFile`/`executeDeleteAllCorrupt` |
+| A6 | klein | ~~`dbFilePath` wird in die DB-JSON persistiert~~ **behoben in F8**: wird beim Speichern (auch bei Hash-Migration) entfernt | App.tsx `saveDatabase` |
 | A7 | klein | Legacy-Zähler prüft `files['scannedRanges']` (existiert nie – Root-Feld), Root-Legacy wird nie gezählt | ActionModals.tsx `runStructureCheck` |
-| A8 | klein | `checkIntegrity`-Typ deklariert `(basePath, files)`, Aufruf mit `onlySubset` via `@ts-ignore` | types.ts / App.tsx |
+| A8 | klein | ~~`checkIntegrity`-Typ deklariert `(basePath, files)`, Aufruf mit `onlySubset` via `@ts-ignore`~~ **behoben in F9**: Typ um `onlySubset?: boolean` ergänzt, `@ts-ignore` entfernt | types.ts / ActionModals.tsx |
 | A9 | klein | „Neuen Ordner wählen“ bei existierender DB warnt nur per Log; startet man, werden alle Dateien neu geladen (Kollisions-Kopien) | App.tsx `handleInitNewDatabase` |
 | A10 | klein | `handleShowFileInExplorer` → `onShowInFolder`-Prop ist tote Kette (CorrectionModal nutzt sie nie) | App.tsx / ActionModals.tsx |
+| K4 | mittel | ~~Duplikat-Lösch-/Re-Download-Zyklus durch Dateinamen-Heuristik bei gleichnamigen Google-Fotos~~ **behoben in F6**: nur Hash-Duplikate; Online-Einträge werden nie gelöscht | main.cjs `check-db-integrity`, databaseUtils `resolveDuplicatesOnDisk` |
+| K5 | kritisch | ~~Ein-Schritt-Lag: Panel-Refresh-Wait akzeptierte das Vorgängerfoto als „refreshed" (nur Signaturänderung geprüft) → jedes Foto bekam das Google-Datum des Vorgängers; Lag perpetuierte sich; `trusted=true` schrieb Falschdaten in EXIF/FS/DB~~ **behoben in F1.3/F1.4**: Namens-Anker + Resync (mit URL-Verifikation) + Session-Abbruch bei nicht behebbarem Desync; deterministischer Start per `loadURL` + Panel-Öffnungs-Check (der F1.3-Nudge erwies sich als Sackgasse und wurde entfernt). **Zusatzursache gefunden/behoben:** Der F1.2-Teilscan über den gecachten Panel-Container lieferte veraltete Panel-Inhalte (sichtbarer Panel war aktuell) → F1.2-Teilscan zurückgebaut, Vollscan wieder aktiv; `pendingInfo` bleibt. | App.tsx `waitForPanelRefresh`, `navigateAndVerifyChange`, `runBackupSession`, crawlerActions `extractCurrentImageInfo` |
 
 ---
 
@@ -445,6 +475,7 @@ Diese Punkte sind bewusst dokumentiert, damit Agenten sie nicht für funktionier
 | **hash** | SHA-256 der Datei auf der Platte nach Rewrite (änderbar durch Korrekturen) |
 | **trusted** | Metadaten-Scrape gilt als verlässlich; sonst keine Rewrites/Korrekturen |
 | **Orphan / vermisst** | DB-Eintrag mit `missingSince`, Datei fehlt lokal |
+| **onlineMissing** | DB-Eintrag mit `onlineMissingSince`: Datei lokal vorhanden, aber online im Scan nicht gesehen |
 | **corrupt** | Datei mit 0 Bytes oder Lesefehler (`integrityStatus === 'corrupt'`) |
 | **Turbo-Backup** | Der parallele Crawler-Loop (max. 5 gleichzeitige Downloads) |
 | **Batch** | 1000 Loop-Iterationen, danach Sicherheits-Checkpoint |

@@ -69,7 +69,8 @@ export interface DatabaseEntry {
     hash?: string;         // SHA-256 der Datei WIE SIE AUF DER PLATTE LIEGT (nach Metadaten-Rewrite)
     sourceHash?: string;   // SHA-256 des Google-Rohdownloads VOR jedem lokalen Rewrite (stabiler Quell-Fingerprint)
     size?: number;         // NEU: Dateigröße in Bytes
-    missingSince?: number; // Timestamp, wann das Bild erstmals nicht mehr gefunden wurde
+    missingSince?: number; // Timestamp, wann die Datei erstmals lokal nicht mehr gefunden wurde
+    onlineMissingSince?: number; // Timestamp, wann das Bild online (im Scan) erstmals nicht mehr gesehen wurde (Datei lokal vorhanden)
     integrityStatus?: 'ok' | 'corrupt'; // NEU: Ergebnis des File-Checks
     integrityCheckedAt?: number; // NEU: Wann geprüft
 }
@@ -134,7 +135,7 @@ declare global {
       loadDatabase: (filePath: string) => Promise<FileDatabase | null>; // Nimmt jetzt FilePath
       saveDatabase: (filePath: string, data: FileDatabase) => Promise<boolean>;
       saveTextFile: (filePath: string, content: string) => Promise<{success: boolean, path?: string, error?: string}>; // NEU: CSV Export
-      checkIntegrity: (basePath: string, files: Record<string, DatabaseEntry>) => Promise<IntegrityResult>;
+      checkIntegrity: (basePath: string, files: Record<string, DatabaseEntry>, onlySubset?: boolean) => Promise<IntegrityResult>;
       findRenamableFiles: (basePath: string, files: Record<string, DatabaseEntry>) => Promise<{ candidates: RenamableFile[], stats: RenamableStats }>;
       verifyFileIntegrityBatch: (basePath: string, files: {id: string, filename: string, timestamp: number}[]) => Promise<Record<string, 'ok' | 'corrupt'>>; // NEU
 

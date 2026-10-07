@@ -74,6 +74,30 @@ export const toggleInfoPanel = async (webview: any): Promise<void> => {
     `);
 };
 
+// F1.1: Scrollt das groesste scrollbare Element rechts (Info-Panel) ans Ende,
+// damit lazy/virtualisierte Details (z.B. Datum) gerendert werden.
+export const scrollSidePanelToBottom = async (webview: any): Promise<void> => {
+    const script = `
+      (() => {
+          const thresholdX = window.innerWidth * 0.7;
+          const all = document.querySelectorAll('*');
+          let best = null;
+          let bestArea = 0;
+          for (const el of all) {
+              if (el.scrollHeight <= el.clientHeight + 20) continue;
+              const rect = el.getBoundingClientRect();
+              if (rect.width === 0 || rect.height === 0) continue;
+              if (rect.left < thresholdX) continue;
+              const area = rect.width * rect.height;
+              if (area > bestArea) { bestArea = area; best = el; }
+          }
+          if (best) { best.scrollTop = best.scrollHeight; return true; }
+          return false;
+      })();
+    `;
+    try { await webview.executeJavaScript(script); } catch(e) {}
+};
+
 export const killVideoPlayers = async (webview: any): Promise<void> => {
     const script = `
       (() => {
@@ -91,15 +115,16 @@ export const killVideoPlayers = async (webview: any): Promise<void> => {
     try { await webview.executeJavaScript(script); } catch(e) {}
 };
 
-export const extractCurrentImageInfo = async (webview: any): Promise<{id: string, dateStr: string, potentialFilename?: string}> => {
+export const extractCurrentImageInfo = async (webview: any): Promise<{id: string, dateStr: string, potentialFilename?: string, panelSignature: string}> => {
     const script = `
       (async () => {
           const browserUrl = window.location.href;
           const match = browserUrl.match(/photo\\/([^?#]+)/);
           const id = match ? match[1] : browserUrl;
 
-          // --- Metadaten Scan (Sidebar) ---
-          const thresholdX = window.innerWidth * 0.7; 
+          // Vollscan (wie vor F1.2): Der fruehere gecachte Panel-Container-Teilscan
+          // lieferte nach Navigationen veraltete (versteckte) Panel-Inhalte.
+          const thresholdX = window.innerWidth * 0.7;
           const allElements = document.querySelectorAll('*');
           let collectedText = [];
           let potentialFilename = null;
@@ -113,7 +138,7 @@ export const extractCurrentImageInfo = async (webview: any): Promise<{id: string
                   const label = el.getAttribute('aria-label');
                   if (label) collectedText.push(label);
 
-                  if (['DIV', 'SPAN', 'P', 'H1', 'H2', 'H3', 'TIME'].includes(el.tagName)) {
+                  if (['DIV', 'SPAN', 'P', 'H1', 'H2', 'H3', 'H4', 'TIME', 'BUTTON', 'A', 'LI', 'TD', 'LABEL'].includes(el.tagName)) {
                       const txt = el.innerText;
                       if (txt && txt.trim().length > 0 && txt.length < 200) {
                            collectedText.push(txt);
@@ -137,11 +162,14 @@ export const extractCurrentImageInfo = async (webview: any): Promise<{id: string
           }
           const uniqueTexts = [...new Set(collectedText)];
           const dateStr = uniqueTexts.join('\\n');
+          // Kompakter Fingerprint des Panels fuer den Panel-Refresh-Wait (F1)
+          const panelSignature = uniqueTexts.join('|').substring(0, 512) + '::' + uniqueTexts.length + '::' + (potentialFilename || '');
           
           return {
               id: id,
               dateStr: dateStr,
-              potentialFilename: potentialFilename
+              potentialFilename: potentialFilename,
+              panelSignature: panelSignature
           };
       })();
     `;

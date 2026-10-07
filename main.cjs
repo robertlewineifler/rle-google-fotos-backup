@@ -98,6 +98,16 @@ let nextDownloadConfig = {
     flatStructure: false
 };
 
+// F5 (A4): Reservierte Zielpfade gegen Namenskollisions-Race bei parallelen Downloads.
+// 'will-download' feuert, bevor die Datei physisch existiert – existsSync allein reicht daher nicht.
+const reservedTargetPaths = new Set();
+function isTargetPathTaken(dir, filename) {
+    const fullLower = path.join(dir, filename).toLowerCase();
+    return reservedTargetPaths.has(fullLower) || fs.existsSync(path.join(dir, filename));
+}
+function reserveTargetPath(fullPath) { reservedTargetPaths.add(fullPath.toLowerCase()); }
+function releaseTargetPath(fullPath) { reservedTargetPaths.delete(fullPath.toLowerCase()); }
+
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1400,
@@ -186,12 +196,13 @@ function createWindow() {
     const nameWithoutExt = baseName; // Bereits gekürzt
     let counter = 1;
     
-    while (fs.existsSync(path.join(targetSubFolder, finalFilename))) {
+    while (isTargetPathTaken(targetSubFolder, finalFilename)) {
         finalFilename = `${nameWithoutExt} (${counter})${ext}`;
         counter++;
     }
 
     let savePath = path.join(targetSubFolder, finalFilename);
+    reserveTargetPath(savePath);
     item.setSavePath(savePath);
 
     appendLog('info', `Download Start: id=${config.id} file=${finalFilename} dir=${targetSubFolder} webDate=${webDate.toLocaleString()} trusted=${trusted}`);
@@ -258,12 +269,14 @@ function createWindow() {
                         const lowerImageExt = imageExt.toLowerCase();
 
                         // Kollisionsprüfung für das entpackte Bild
-                        while (fs.existsSync(path.join(targetSubFolder, newFilename))) {
+                        while (isTargetPathTaken(targetSubFolder, newFilename)) {
                             newFilename = `${imageNameNoExt} (${zipCounter})${lowerImageExt}`;
                             zipCounter++;
                         }
                         
                         const newSavePath = path.join(targetSubFolder, newFilename);
+                        reserveTargetPath(newSavePath);
+                        releaseTargetPath(savePath); // ZIP-Pfad wird gleich gelöscht
                         
                         // Entpacken
                         fs.writeFileSync(newSavePath, imageEntry.getData());
@@ -354,6 +367,7 @@ function createWindow() {
           resultPayload.success = false;
           resultPayload.error = globalErr.message;
       } finally {
+          releaseTargetPath(savePath); // F5: Reservierung freigeben (Datei existiert jetzt bzw. Download beendet)
           // WICHTIG: Sende IMMER eine Antwort, damit der Slot im React-Frontend freigegeben wird.
           const srcLog = resultPayload.sourceHash ? resultPayload.sourceHash.substring(0, 10) + '…' : '-';
           const fileLog = resultPayload.hash ? resultPayload.hash.substring(0, 10) + '…' : '-';
@@ -625,46 +639,14 @@ ipcMain.handle('check-db-integrity', async (event, { basePath, files, onlySubset
         }
     }
 
-    // 1. Hash basierte Duplikate
+    // Duplikate: NUR hash-basiert (identischer Dateiinhalt).
+    // F6: Die frühere Dateinamen-Heuristik ("Name (n)" + gleiche Größe + mtime) wurde entfernt.
+    // Sie hat legitime, online vorhandene Google-Fotos mit gleichem Namen fälschlich als
+    // Duplikate markiert → Löschung + erneuter Download (Endlos-Zyklus).
     validFiles.forEach(f => {
         if(f.hash) {
              if (!hashRegistry[f.hash]) hashRegistry[f.hash] = [];
              hashRegistry[f.hash].push(f.id);
-        }
-    });
-
-    // 2. Heuristische Duplikate (Dateiname (1) + Gleiche Größe + Gleiches Datum)
-    // Map für schnellen Zugriff auf "saubere" Dateinamen
-    const fileLookup = new Map(); // Key: "Year|Month|Filename" -> FileObj
-    validFiles.forEach(f => fileLookup.set(`${f.year}|${f.month}|${f.filename}`, f));
-
-    // Regex für "Name (1).ext"
-    const copyRegex = /^(.*?)\s\(\d+\)(\.[^.]+)$/;
-
-    validFiles.forEach(f => {
-        const match = f.filename.match(copyRegex);
-        if (match) {
-            const cleanName = match[1] + match[2]; // Base + Ext
-            const cleanKey = `${f.year}|${f.month}|${cleanName}`;
-            const cleanFile = fileLookup.get(cleanKey);
-
-            if (cleanFile) {
-                // Vergleich: Gleiche Größe und Datum (Toleranz 2s für Dateisystem-Unterschiede)
-                const timeDiff = Math.abs(f.mtime - cleanFile.mtime);
-                if (f.size === cleanFile.size && timeDiff < 2000) {
-                     // Treffer! Wir gruppieren diese Dateien.
-                     // Falls beide Hashes haben, sind sie schon in Schritt 1 erfasst.
-                     // Falls nicht, erstellen wir eine künstliche Gruppe.
-                     
-                     // Wir nutzen einen synthetischen Key, falls kein gemeinsamer Hash existiert
-                     let groupKey = cleanFile.hash || f.hash || `HEURISTIC_${cleanFile.id}_${f.size}`;
-                     
-                     if (!hashRegistry[groupKey]) hashRegistry[groupKey] = [];
-                     
-                     if (!hashRegistry[groupKey].includes(cleanFile.id)) hashRegistry[groupKey].push(cleanFile.id);
-                     if (!hashRegistry[groupKey].includes(f.id)) hashRegistry[groupKey].push(f.id);
-                }
-            }
         }
     });
 
