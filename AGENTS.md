@@ -4,7 +4,7 @@
 > Bei **jeder** Änderung am Code, an den Typen, an der Datenbankstruktur, an IPC-Kanälen, an den Build-Skripten oder am Verhalten der App muss diese `AGENTS.md` **im selben Arbeitsschritt** mit aktualisiert werden. Diese Datei ist die zentrale Wissensbasis für nachfolgende Chats/Agenten. Veraltete Angaben hier gelten als Bug.
 > Diese Datei nicht löschen oder umbenennen. Änderungen immer in deutscher Sprache ergänzen (Projektsprache).
 
-- Version (package.json): **1.1.0**
+- Version (package.json): **1.2.0**
 - Plattform: **Windows-Desktop** (Electron). Kein Mac/Linux-Support angestrebt (Windows-spezifische Pfade/APIs).
 - Repository: `https://github.com/robertlewineifler/rle-google-fotos-backup`
 - UI-Sprache: **Deutsch**. Code-Bezeichner/Kommentare: überwiegend Englisch, teils Deutsch.

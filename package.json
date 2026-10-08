@@ -1,7 +1,6 @@
-
 {
   "name": "rle-google-fotos-backup",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "RLE Google Fotos Backup – lädt Google Fotos herunter und korrigiert EXIF-Daten",
   "main": "main.cjs",
   "type": "module",
@@ -41,7 +40,11 @@
       "preload.cjs"
     ],
     "win": {
-      "target": ["dir", "portable", "nsis"],
+      "target": [
+        "dir",
+        "portable",
+        "nsis"
+      ],
       "icon": "public/icon.ico"
     }
   }
