@@ -1,7 +1,7 @@
 
 
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { ProcessingLog, DownloadedFile, DownloadResult, FileDatabase, DatabaseEntry, IntegrityResult, DownloadProgress, SkippedDownload, UntrackedFile } from './types';
+import { ProcessingLog, DownloadedFile, DownloadResult, FileDatabase, DatabaseEntry, IntegrityResult, DownloadProgress, SkippedDownload, UntrackedFile, RenamableFile, CleanupPreview, CleanupPlanItem, CleanupSummary } from './types';
 import { parseGoogleDateString, parseExifDateToDate, getIsoDateString } from './utils/exifUtils';
 import * as Crawler from './logic/crawlerActions';
 import * as DbUtils from './logic/databaseUtils';
@@ -19,6 +19,12 @@ const VERBOSE_TRUST_LOG = false;
 // F18: Debug-Meldungen, die trotzdem im UI-Log-Fenster erscheinen (Logdatei bleibt [debug]).
 const DEBUG_UI_KEYWORDS = ['Panel-Wait-Timeout', 'Bekannt:'];
 
+// F29: Endung eines Dateinamens kleinschreiben (restlicher Name unverändert)
+const lowerExtName = (name: string): string => {
+    const dot = name.lastIndexOf('.');
+    return dot > 0 ? name.slice(0, dot) + name.slice(dot).toLowerCase() : name;
+};
+
 const App: React.FC = () => {
   // --- UI State ---
   const [isInitialized, setIsInitialized] = useState(false);
@@ -32,6 +38,9 @@ const App: React.FC = () => {
   const [processedCount, setProcessedCount] = useState(0);
   const [downloadedFiles, setDownloadedFiles] = useState<DownloadedFile[]>([]);
   const [scannedDays, setScannedDays] = useState<Record<string, number>>({});
+  // F28: kurzer Flyout-Hinweis nach DB-Backup
+  const [backupNotice, setBackupNotice] = useState('');
+  const backupNoticeTimerRef = useRef<number | null>(null);
 
   // State für mehrere parallele Downloads (Job-Key/Filename -> Progress)
   const [activeProgress, setActiveProgress] = useState<Record<string, DownloadProgress>>({});
@@ -41,6 +50,9 @@ const App: React.FC = () => {
   // --- Database & Tracking State (Refs) ---
   const dbRef = useRef<FileDatabase>({ basePath: '', lastUpdated: 0, files: {}, scannedDays: {}, skippedDownloads: {} });
   const processedIdsRef = useRef<Set<string>>(new Set());
+  // F29: Vorschau-Daten der Dateinamen-Bereinigung (vom Struktur-Check gefüllt, erst nach Bestätigung ausgeführt)
+  const cleanupCandidatesRef = useRef<RenamableFile[]>([]);
+  const cleanupUntrackedRef = useRef<UntrackedFile[]>([]);
   const sessionSeenIds = useRef<Set<string>>(new Set());
   const minDateEncountered = useRef<number | null>(null);
   const maxDateEncountered = useRef<number | null>(null);
@@ -497,6 +509,7 @@ const App: React.FC = () => {
                 try {
                     const migrateSave = { ...loadedDb, basePath: '.' };
                     delete migrateSave.dbFilePath; // F8: absoluten Altpfad nicht persistieren
+                    await window.electron.createDatabaseBackup(filePath, 'force', 'Hash-Migration'); // F28
                     await window.electron.saveDatabase(filePath, migrateSave);
                     setTimeout(() => addLog(`🔀 Hash-Migration: ${migrated} Einträge (alter Hash -> sourceHash) gespeichert.`, 'info'), 700);
                 } catch (migErr) {
@@ -582,6 +595,26 @@ const App: React.FC = () => {
       }
   };
 
+  // F28: DB-Backup – 'daily' = einmal pro Kalendertag, 'force' = vor irreversiblen Bulk-Aktionen
+  const backupDatabase = async (mode: 'daily' | 'force', reason: string) => {
+      const targetPath = dbFilePathRef.current;
+      if (!targetPath || !window.electron) return;
+      try {
+          const res = await window.electron.createDatabaseBackup(targetPath, mode, reason);
+          if (res?.success && res.created) {
+              addLog(`📦 DB-Backup erstellt (${reason}).`, 'info');
+              // F28: kurzer Flyout-Hinweis für den Nutzer
+              setBackupNotice(`📦 DB-Backup erstellt (${reason}).`);
+              if (backupNoticeTimerRef.current) window.clearTimeout(backupNoticeTimerRef.current);
+              backupNoticeTimerRef.current = window.setTimeout(() => setBackupNotice(''), 8000);
+          } else if (!res?.success) {
+              addLog(`WARNUNG: DB-Backup fehlgeschlagen (${reason}).`, 'error');
+          }
+      } catch (err: any) {
+          addLog(`DB-BACKUP ERROR: ${err.message}`, 'error');
+      }
+  };
+
   // --- INTEGRITY & CHECKS ---
   
   // Callback: Wird vom Modal (F22: Prüfung & Korrekturen) aufgerufen, wenn Struktur-Check fertig ist
@@ -634,107 +667,50 @@ const App: React.FC = () => {
           addLog(`${clearedMissing} Vermisst-Status zurückgesetzt (Datei wieder vorhanden).`, 'success');
       }
 
-      // F23: Automatische Auflösung hash-identischer "(n)"-Paare (keine Buttons nötig)
-      let autoRenamedTotal = 0;   // F26: Zähler für den Info-Banner
-      let autoResolvedTotal = 0;  // F26: Duplikate + Kollisionsreste
-      if (result.untracked && result.untracked.length > 0 && exportPath) {
-          const remaining: UntrackedFile[] = [];
-          for (const file of result.untracked) {
-              try {
-                  const hasSuffix = /\(\d+\)/.test(file.filename);
-
-                  if (file.trackedDuplicate) {
-                      // Inverser Fall: DB zeigt auf "Name (n).ext", Basisdatei liegt untracked vor
-                      const td = file.trackedDuplicate;
-                      const entry = dbRef.current.files[td.id];
-                      if (entry && file.hash && entry.hash && file.hash === entry.hash) {
-                          entry.filename = file.filename;
-                          await saveDatabase(); // erst DB umstellen, dann löschen
-                          const deleted = await window.electron.deleteFile({ basePath: exportPath, filename: td.filename, timestamp: entry.timestamp });
-                          addLog(deleted
-                              ? `Duplikat automatisch aufgelöst: DB → ${file.filename}, "${td.filename}" gelöscht.`
-                              : `DB auf ${file.filename} umgestellt, aber "${td.filename}" konnte nicht gelöscht werden.`,
-                              deleted ? 'success' : 'warning');
-                          if (deleted) { autoResolvedTotal++; continue; }
-                          remaining.push(file);
-                      } else {
-                          remaining.push(file);
-                      }
-                  } else if (file.duplicateOf && hasSuffix && file.hash) {
-                      // Normaler Fall: untracked "(n)"-Datei mit identischem Inhalt -> löschen
-                      const ts = new Date(Number(file.year), Number(file.month) - 1, 1).getTime();
-                      const deleted = await window.electron.deleteFile({ basePath: exportPath, filename: file.filename, timestamp: ts });
-                      addLog(deleted
-                          ? `Kollisionsrest automatisch gelöscht: ${file.filename} (Duplikat von ${file.duplicateOf}).`
-                          : `Kollisionsrest konnte nicht gelöscht werden: ${file.filename}`,
-                          deleted ? 'success' : 'warning');
-                      if (deleted) { autoResolvedTotal++; continue; }
-                      remaining.push(file);
-                  } else {
-                      remaining.push(file);
-                  }
-              } catch (e: any) {
-                  addLog(`Auto-Auflösung fehlgeschlagen (${file.filename}): ${e.message}`, 'warning');
-                  remaining.push(file);
-              }
-          }
-          result = { ...result, untracked: remaining };
-      }
-
-      // F24: Dateinamen-Prüfung automatisch ausführen + sichere Aktionen anwenden; Ergebnis für den Info-Tab
+      // F29: Dateinamen-Prüfung nur noch als Vorschau – ausgeführt wird erst nach Bestätigung
+      // im Fenster „Prüfung & Korrekturen“ über executeCleanFilenames().
+      let cleanupPreview: CleanupPreview = { items: [], skipped: [] };
       if (exportPath) {
           try {
               const renameResult = await window.electron.findRenamableFiles(exportPath, dbRef.current.files);
+              const candidates = renameResult?.candidates || [];
+              const untracked = result.untracked || [];
+              cleanupCandidatesRef.current = candidates;
+              cleanupUntrackedRef.current = untracked;
 
-              for (const item of (renameResult?.candidates || [])) {
-                  try {
-                      if (item.resolveDuplicate) {
-                          const entry = dbRef.current.files[item.id];
-                          if (!entry) continue;
-                          const hashRes = await window.electron.computeFileHash({ basePath: exportPath, filename: item.currentName, timestamp: item.timestamp });
-                          if (!hashRes.success || (entry.hash && hashRes.hash !== entry.hash)) {
-                              addLog(`Duplikat-Auflösung übersprungen (Hash nicht bestätigt): ${item.currentName}`, 'warning');
-                              continue;
-                          }
-                          entry.filename = item.newName;
-                          await saveDatabase(); // erst DB umstellen, dann löschen
-                          const deleted = await window.electron.deleteFile({ basePath: exportPath, filename: item.currentName, timestamp: item.timestamp });
-                          if (deleted) {
-                              autoResolvedTotal++;
-                              addLog(`Duplikat automatisch aufgelöst: DB → ${item.newName}, "${item.currentName}" gelöscht.`, 'success');
-                          } else {
-                              addLog(`DB auf ${item.newName} umgestellt, aber "${item.currentName}" konnte nicht gelöscht werden.`, 'warning');
-                          }
-                          continue;
-                      }
-
-                      const res = await window.electron.renameFile({
-                          basePath: exportPath,
-                          oldName: item.currentName,
-                          newName: item.newName,
-                          timestamp: item.timestamp,
-                          expectedHash: dbRef.current.files[item.id]?.hash
-                      });
-                      if (res.success) {
-                          if (dbRef.current.files[item.id]) dbRef.current.files[item.id].filename = item.newName;
-                          autoRenamedTotal++;
-                          addLog(`Automatisch umbenannt: ${item.currentName} → ${item.newName}`, 'success');
-                      } else {
-                          addLog(`Automatisches Umbenennen fehlgeschlagen: ${item.currentName} (${res.error || 'unbekannt'})`, 'warning');
-                      }
-                  } catch (e: any) {
-                      addLog(`Auto-Umbenennung fehlgeschlagen (${item.currentName}): ${e.message}`, 'warning');
+              const items: CleanupPlanItem[] = [];
+              const resolvedIds = new Set<string>();
+              for (const file of untracked) {
+                  if (file.trackedDuplicate) {
+                      const to = lowerExtName(file.filename);
+                      items.push({ kind: 'resolve', from: file.trackedDuplicate.filename, to, reason: 'trackedDuplicate' });
+                      resolvedIds.add(file.trackedDuplicate.id);
+                  } else if (file.duplicateOf) {
+                      items.push({ kind: 'delete', from: file.filename, reason: 'duplicate' });
                   }
               }
+              for (const c of candidates) {
+                  if (resolvedIds.has(c.id)) continue; // wird bereits über trackedDuplicate aufgelöst
+                  if (c.resolveDuplicate) {
+                      items.push({ kind: 'resolve', from: c.currentName, to: c.newName, reason: 'suffix' });
+                  } else {
+                      items.push({
+                          kind: 'rename',
+                          from: c.currentName,
+                          to: c.newName,
+                          reason: c.doubleExt ? 'doubleExt' : c.caseOnlyExt ? 'extLowercase' : 'suffix'
+                      });
+                  }
+              }
+              cleanupPreview = { items, skipped: [] };
 
               result = {
                   ...result,
                   renamable: {
                       entries: renameResult?.entries || [],
-                      stats: renameResult?.stats,
-                      autoRenamed: autoRenamedTotal,
-                      autoResolved: autoResolvedTotal
-                  }
+                      stats: renameResult?.stats
+                  },
+                  cleanupPreview
               };
           } catch (e: any) {
               addLog(`Dateinamen-Prüfung fehlgeschlagen: ${e.message}`, 'warning');
@@ -744,6 +720,124 @@ const App: React.FC = () => {
       setIntegrityResult(result);
       updateOrphansList(); // F17: Liste immer aktualisieren (auch bei 0 neuen Missing-Einträgen)
       saveDatabase();
+  };
+
+  // F29: Führt die geplante Dateinamen-Bereinigung aus (nur nach Bestätigung im Modal).
+  const executeCleanFilenames = async (): Promise<CleanupSummary> => {
+      const summary: CleanupSummary = { renamed: 0, doubleExt: 0, extLowercased: 0, removed: 0, failed: 0 };
+      const targetPath = dbFilePathRef.current;
+      if (!targetPath || !exportPath || !window.electron) return summary;
+
+      await backupDatabase('force', 'Dateinamen bereinigen');
+
+      const candidates = cleanupCandidatesRef.current;
+      const untracked = cleanupUntrackedRef.current;
+      const resolvedIds = new Set<string>();
+      const handledUntrackedPaths = new Set<string>();
+
+      // 1) Getrackte "(n)"-Einträge mit hash-identischer Basisdatei auflösen (DB → Basisname, "(n)"-Datei löschen)
+      for (const file of untracked) {
+          if (!file.trackedDuplicate) continue;
+          const td = file.trackedDuplicate;
+          const entry = dbRef.current.files[td.id];
+          if (!entry) continue;
+          if (!(file.hash && entry.hash && file.hash === entry.hash)) {
+              summary.failed++;
+              addLog(`Duplikat-Auflösung übersprungen (Hash nicht bestätigt): ${file.filename}`, 'warning');
+              continue;
+          }
+          const targetName = lowerExtName(file.filename);
+          entry.filename = targetName;
+          resolvedIds.add(td.id);
+          if (targetName !== file.filename) {
+              const r = await window.electron.renameFile({ basePath: exportPath, oldName: file.filename, newName: targetName, timestamp: entry.timestamp, expectedHash: file.hash });
+              if (r.success) { summary.renamed++; summary.extLowercased++; }
+          }
+          const deleted = await window.electron.deleteFile({ basePath: exportPath, filename: td.filename, timestamp: entry.timestamp });
+          if (deleted) { summary.removed++; handledUntrackedPaths.add(file.path); addLog(`Duplikat aufgelöst: DB → ${targetName}, "${td.filename}" gelöscht.`, 'success'); }
+          else { summary.failed++; addLog(`DB auf ${targetName} umgestellt, "${td.filename}" konnte nicht gelöscht werden.`, 'warning'); }
+      }
+
+      // 2) Untracked Dateien mit identischem Inhalt zu einem DB-Eintrag entfernen
+      // (Duplikate/Kollisionsreste, inkl. der Doppelendungs-Zwillinge)
+      for (const file of untracked) {
+          if (file.trackedDuplicate || !file.duplicateOf) continue;
+          const ts = new Date(Number(file.year), Number(file.month) - 1, 1).getTime();
+          const deleted = await window.electron.deleteFile({ basePath: exportPath, filename: file.filename, timestamp: ts });
+          if (deleted) { summary.removed++; handledUntrackedPaths.add(file.path); addLog(`Duplikat entfernt: ${file.filename} (Duplikat von ${file.duplicateOf}).`, 'success'); }
+          else { summary.failed++; addLog(`Duplikat konnte nicht entfernt werden: ${file.filename}`, 'warning'); }
+      }
+
+      // 3) Umbenennungen: "(n)"-Auflösung, Doppelendung, Endung kleinschreiben (Hash-Gate)
+      for (const item of candidates) {
+          if (resolvedIds.has(item.id)) continue;
+          const entry = dbRef.current.files[item.id];
+          if (!entry) continue;
+          try {
+              if (item.resolveDuplicate) {
+                  const hashRes = await window.electron.computeFileHash({ basePath: exportPath, filename: item.currentName, timestamp: item.timestamp });
+                  if (!hashRes.success || !hashRes.hash || (entry.hash && hashRes.hash !== entry.hash)) {
+                      summary.failed++;
+                      addLog(`Duplikat-Auflösung übersprungen (Hash nicht bestätigt): ${item.currentName}`, 'warning');
+                      continue;
+                  }
+                  entry.filename = item.newName;
+                  await saveDatabase(); // erst DB umstellen, dann löschen
+                  const deleted = await window.electron.deleteFile({ basePath: exportPath, filename: item.currentName, timestamp: item.timestamp });
+                  if (deleted) { summary.removed++; addLog(`Duplikat aufgelöst: DB → ${item.newName}, "${item.currentName}" gelöscht.`, 'success'); }
+                  else { summary.failed++; addLog(`DB auf ${item.newName} umgestellt, "${item.currentName}" konnte nicht gelöscht werden.`, 'warning'); }
+                  continue;
+              }
+
+              // Hash-Gate: gespeicherten Hash verwenden, sonst einmalig berechnen (rename-file prüft ihn dann erneut)
+              let expectedHash = entry.hash;
+              if (!expectedHash) {
+                  const hashRes = await window.electron.computeFileHash({ basePath: exportPath, filename: item.currentName, timestamp: item.timestamp });
+                  if (!hashRes.success || !hashRes.hash) {
+                      summary.failed++;
+                      addLog(`Umbenennung übersprungen (Datei nicht lesbar): ${item.currentName}`, 'warning');
+                      continue;
+                  }
+                  expectedHash = hashRes.hash;
+                  entry.hash = hashRes.hash;
+              }
+
+              const res = await window.electron.renameFile({
+                  basePath: exportPath,
+                  oldName: item.currentName,
+                  newName: item.newName,
+                  timestamp: item.timestamp,
+                  expectedHash
+              });
+              if (res.success) {
+                  entry.filename = item.newName;
+                  summary.renamed++;
+                  if (item.doubleExt) summary.doubleExt++;
+                  if (item.caseOnlyExt) summary.extLowercased++;
+              } else {
+                  summary.failed++;
+                  addLog(`Umbenennung fehlgeschlagen: ${item.currentName} (${res.error || 'unbekannt'})`, 'warning');
+              }
+          } catch (e: any) {
+              summary.failed++;
+              addLog(`Umbenennung fehlgeschlagen (${item.currentName}): ${e.message}`, 'warning');
+          }
+      }
+
+      cleanupCandidatesRef.current = [];
+      cleanupUntrackedRef.current = [];
+      await saveDatabase();
+      updateOrphansList();
+      setIntegrityResult(prev => prev ? {
+          ...prev,
+          untracked: (prev.untracked || []).filter(f => !handledUntrackedPaths.has(f.path)),
+          cleanupPreview: { items: [], skipped: [] }
+      } : prev);
+      setProcessedCount(prev => prev + 1);
+
+      const failPart = summary.failed > 0 ? `, ${summary.failed} fehlgeschlagen (siehe Log)` : '';
+      addLog(`Dateinamen bereinigt: ${summary.renamed} umbenannt (${summary.doubleExt} Doppelendungen, ${summary.extLowercased} Endungen kleingeschrieben), ${summary.removed} Duplikate/Reste entfernt${failPart}.`, summary.failed > 0 ? 'warning' : 'success');
+      return summary;
   };
 
   // Callback: Wird vom Modal aufgerufen, wenn neue Status-Updates für Dateien vorliegen
@@ -803,6 +897,7 @@ const App: React.FC = () => {
       if (corrupt.length === 0) return;
       if (!confirm(`Wirklich alle ${corrupt.length} defekten Dateien von der Festplatte löschen? Sie werden beim nächsten Scan erneut heruntergeladen.`)) return;
 
+      await backupDatabase('force', 'Defekte Dateien löschen');
       addLog(`Lösche ${corrupt.length} defekte Dateien von Disk...`, 'info');
       
       let deletedCount = 0;
@@ -836,6 +931,7 @@ const App: React.FC = () => {
       if (!dbRef.current) return;
       if (!confirm("Veraltete Datenfelder werden aus der Datenbank-Datei entfernt. Die Dateien selbst bleiben unberührt.")) return;
       
+      await backupDatabase('force', 'Legacy-Bereinigung');
       addLog("Bereinige veraltete Datenfelder...", 'info');
       
       // 1. Root Legacy löschen
@@ -889,6 +985,7 @@ const App: React.FC = () => {
       if (!exportPath || orphans.length === 0) return;
       if(!confirm(`Sicher? ${orphans.length} Einträge werden aus der DB entfernt (Dateien fehlen ja bereits).`)) return;
       
+      await backupDatabase('force', 'Vermisste aus DB entfernen');
       addLog(`Lösche ${orphans.length} vermisste Dateien aus DB...`, 'info');
       try {
         // Hier löschen wir nur aus DB, da Orphan = Datei fehlt physikalisch
@@ -971,6 +1068,7 @@ const App: React.FC = () => {
       if (!exportPath || onlineMissing.length === 0) return;
       if (!confirm(`Wirklich alle ${onlineMissing.length} Dateien von der Festplatte löschen und aus der DB entfernen?`)) return;
 
+      await backupDatabase('force', 'Online-nicht-gefunden löschen');
       addLog(`Lösche ${onlineMissing.length} online-nicht-gefundene Dateien von Disk...`, 'info');
       let deletedCount = 0;
       let failedCount = 0;
@@ -1005,6 +1103,7 @@ const App: React.FC = () => {
       if (!exportPath || !integrityResult || integrityResult.duplicates.length === 0) return;
       if (!confirm(`Duplikat-Bereinigung starten?\n\nEs werden nur Offline-Kopien gelöscht (Einträge, die online nicht mehr gefunden wurden). Online vorhandene Google-Fotos bleiben immer erhalten.`)) return;
       
+      await backupDatabase('force', 'Duplikate bereinigen');
       addLog(`Löse ${integrityResult.duplicates.length} Duplikat-Gruppen auf...`, 'info');
       try {
           const { deletedIds, count, skippedOnlineGroups } = await DbUtils.resolveDuplicatesOnDisk(integrityResult.duplicates, dbRef.current.files, exportPath);
@@ -1104,6 +1203,8 @@ const App: React.FC = () => {
       setSkippedPhotos({}); // F10
       setOnlineMissing([]); // F13
       setIntegrityResult(null);
+      setBackupNotice(''); // F28
+      if (backupNoticeTimerRef.current) { window.clearTimeout(backupNoticeTimerRef.current); backupNoticeTimerRef.current = null; }
       
       // Reset Modal States
       setShowCorrectionModal(false);
@@ -1127,6 +1228,8 @@ const App: React.FC = () => {
       panelScrolledRef.current = false;
       pendingInfoRef.current = null;
       desyncAbortRef.current = false;
+      cleanupCandidatesRef.current = []; // F29: Vorschau eines anderen DB-Stands nie ausführen
+      cleanupUntrackedRef.current = [];
       
       // 4. Force Cleanup of Webview State if possible
       setIsInitialized(false);
@@ -1546,6 +1649,11 @@ const App: React.FC = () => {
       return;
     }
 
+    // F28: Tages-Backup – einmal pro Kalendertag vor dem ersten Scan (Album-Modus: keine DB-Änderungen)
+    if (!isAlbumMode) {
+      await backupDatabase('daily', 'Tagesstart');
+    }
+
     // F1.4: Deterministischer Start – aktuelles Foto neu laden und Panel sicherstellen.
     // Ersetzt den F1.3-Nudge (der das Panel einen Schritt hinterherließ und den Namens-Anker blockierte).
     if (!isAlbumMode) {
@@ -1935,6 +2043,12 @@ const App: React.FC = () => {
 
   return (
     <div className="flex flex-col h-screen bg-slate-900 text-slate-100 overflow-hidden relative">
+      {/* F28: Flyout-Hinweis nach DB-Backup (über allen Modals, z-[100]) */}
+      {backupNotice && (
+        <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[100] bg-green-800/95 border border-green-500 text-white text-sm font-bold px-4 py-2 rounded-lg shadow-2xl pointer-events-none">
+          {backupNotice}
+        </div>
+      )}
       {showCorrectionModal && (
           <CorrectionModal 
               orphans={orphans} 
@@ -1960,10 +2074,12 @@ const App: React.FC = () => {
               onDeleteUntrackedFile={handleDeleteUntrackedFile}
               onShowUntrackedInExplorer={handleShowUntrackedInExplorer}
               onOpenUntracked={handleOpenUntracked}
+              onBeforeBulkDelete={() => backupDatabase('force', 'Verwaiste löschen')}
               onCheckDone={handleIntegrityCheckDone}
               onUpdateFileStatus={handleIntegrityStatusUpdate}
               onExecuteDuplicates={executeResolveDuplicates}
               onCleanLegacy={executeCleanLegacy}
+              onCleanFilenames={executeCleanFilenames}
           />
       )}
 

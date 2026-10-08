@@ -1,8 +1,8 @@
 
-import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { DatabaseEntry, IntegrityResult, SkippedDownload, UntrackedFile } from '../types';
+import React, { useState, useEffect, useMemo } from 'react';
+import { DatabaseEntry, IntegrityResult, SkippedDownload, UntrackedFile, CleanupSummary, RenameCheckEntry } from '../types';
 
-type CorrectionTab = 'missing' | 'corrupt' | 'skipped' | 'online' | 'untracked' | 'filenames';
+type CorrectionTab = 'missing' | 'corrupt' | 'skipped' | 'online' | 'untracked' | 'filenames' | 'duplicates';
 
 interface CorrectionModalProps {
     orphans: { id: string, entry: DatabaseEntry }[];
@@ -38,12 +38,15 @@ interface CorrectionModalProps {
     onDeleteUntrackedFile?: (file: UntrackedFile) => Promise<boolean>;
     onShowUntrackedInExplorer?: (fullPath: string) => void;
     onOpenUntracked?: (fullPath: string) => void;
+    onBeforeBulkDelete?: () => Promise<void>; // F28: DB-Backup vor Batch-Löschungen
 
     // F22: Prüfungen (aus dem früheren Strukturbericht)
     onCheckDone: (result: IntegrityResult) => void;
     onUpdateFileStatus?: (updates: Record<string, 'ok' | 'corrupt'>) => void;
     onExecuteDuplicates: () => void;
     onCleanLegacy?: () => void;
+    // F29: Führt die bestätigte Dateinamen-Bereinigung aus (Umbenennungen/Duplikate/Endungen)
+    onCleanFilenames?: () => Promise<CleanupSummary>;
 }
 
 // F26: Einheitlicher Leerzustand für alle Kategorie-Tabs
@@ -60,8 +63,8 @@ export const CorrectionModal: React.FC<CorrectionModalProps> = ({
     onDeleteCorrupt, onDeleteAllCorrupt,
     onOpenSkipped, onIgnoreSkipped, onIgnoreAllSkipped,
     onResetOnlineMissing, onDeleteAllOnlineMissing, onDeleteOnlineMissing,
-    onDeleteUntrackedFile, onShowUntrackedInExplorer, onOpenUntracked,
-    onCheckDone, onUpdateFileStatus, onExecuteDuplicates, onCleanLegacy
+    onDeleteUntrackedFile, onShowUntrackedInExplorer, onOpenUntracked, onBeforeBulkDelete,
+    onCheckDone, onUpdateFileStatus, onExecuteDuplicates, onCleanLegacy, onCleanFilenames
 }) => {
     const [refreshTrigger, setRefreshTrigger] = useState(0);
 
@@ -86,9 +89,11 @@ export const CorrectionModal: React.FC<CorrectionModalProps> = ({
     const [contentCurrent, setContentCurrent] = useState('');
     const [contentSummary, setContentSummary] = useState('');
     const [showContentDialog, setShowContentDialog] = useState(false); // F26: Auswahl vollständig/offen
-    const [autoFixNotice, setAutoFixNotice] = useState(''); // F26: kurzer Banner nach Auto-Bereinigung
-    const initialCheckStarted = useRef(false); // F26: Struktur-Check automatisch beim Öffnen
-    const awaitingResultRef = useRef(false);   // F26: Banner erst nach neuem Ergebnis anzeigen
+    const [autoFixNotice, setAutoFixNotice] = useState(''); // F29: kurzer Banner nach bestätigter Bereinigung
+    // F29: Bestätigungsdialog für die Dateinamen-Bereinigung (Detail-Liste wird erst auf Klick gerendert)
+    const [showCleanupDialog, setShowCleanupDialog] = useState(false);
+    const [showCleanupList, setShowCleanupList] = useState(false);
+    const [cleanupRunning, setCleanupRunning] = useState(false);
 
     const corruptCount = corruptFiles.length;
     const untrackedCount = untrackedFiles.length;
@@ -124,34 +129,82 @@ export const CorrectionModal: React.FC<CorrectionModalProps> = ({
         { id: 'online', label: 'Online nicht gefunden', count: onlineMissing.length, activeClass: 'bg-violet-700 text-white border-violet-500', idleClass: 'text-violet-300 border-transparent hover:bg-slate-700' },
         { id: 'untracked', label: 'Verwaist', count: untrackedCount, activeClass: 'bg-orange-700 text-white border-orange-500', idleClass: 'text-orange-300 border-transparent hover:bg-slate-700' },
         { id: 'filenames', label: 'Dateinamen', count: renameDisplayEntries.length, activeClass: 'bg-teal-700 text-white border-teal-500', idleClass: 'text-teal-300 border-transparent hover:bg-slate-700' },
+        { id: 'duplicates', label: 'Duplikate', count: duplicateCount, activeClass: 'bg-fuchsia-700 text-white border-fuchsia-500', idleClass: 'text-fuchsia-300 border-transparent hover:bg-slate-700' },
     ];
-    // F26: Struktur-Check automatisch beim Öffnen des Fensters
-    useEffect(() => {
-        if (initialCheckStarted.current) return;
-        initialCheckStarted.current = true;
-        void runStructureCheck();
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, []);
+    // F29: Vorschau-Zähler für „Dateinamen bereinigen“
+    const cleanupItems = structureResult?.cleanupPreview?.items || [];
+    const cleanupRenameCount = cleanupItems.filter(i => i.kind === 'rename').length;
+    const cleanupResolveCount = cleanupItems.filter(i => i.kind === 'resolve').length;
+    const cleanupDeleteCount = cleanupItems.filter(i => i.kind === 'delete').length;
+    const cleanupSuffixCount = cleanupItems.filter(i => i.reason === 'suffix').length;
+    const cleanupSuffixRenameCount = cleanupItems.filter(i => i.kind === 'rename' && i.reason === 'suffix').length;
+    const cleanupDoubleExtCount = cleanupItems.filter(i => i.reason === 'doubleExt').length;
+    const cleanupExtLowerCount = cleanupItems.filter(i => i.reason === 'extLowercase').length;
+    const cleanupTotal = cleanupItems.length;
 
-    // F26: Banner, wenn die Automatik Duplikate/Kollisionsreste entfernt oder Dateien umbenannt hat
-    useEffect(() => {
-        if (!awaitingResultRef.current || !structureResult?.renamable) return;
-        awaitingResultRef.current = false;
-        const ar = structureResult.renamable.autoRenamed || 0;
-        const as = structureResult.renamable.autoResolved || 0;
-        if (ar + as <= 0) return;
-        const parts: string[] = [];
-        if (ar > 0) parts.push(`${ar} Datei(en) umbenannt`);
-        if (as > 0) parts.push(`${as} Duplikat(e)/Kollisionsrest(e) entfernt`);
-        setAutoFixNotice(`✅ Automatisch bereinigt: ${parts.join(', ')}.`);
-        const t = setTimeout(() => setAutoFixNotice(''), 8000);
-        return () => clearTimeout(t);
-    }, [structureResult]);
+    // F29: Dateinamen-Tab – Lazy-Klapplisten je Status (Filter/Sortierung erst beim Ausklappen)
+    const [expandedFilenameStatus, setExpandedFilenameStatus] = useState<Record<string, boolean>>({});
+    useEffect(() => { setExpandedFilenameStatus({}); }, [structureResult]);
+    const anyFilenameExpanded = !!(expandedFilenameStatus.collision || expandedFilenameStatus.nameMismatch || expandedFilenameStatus.noName || expandedFilenameStatus.protected);
+    const filenameEntriesByStatus = useMemo(() => {
+        const map: Record<string, RenameCheckEntry[]> = {};
+        const all = renameInfo?.entries || [];
+        (['collision', 'nameMismatch', 'noName', 'protected'] as const).forEach(st => {
+            if (!expandedFilenameStatus[st]) return;
+            map[st] = all
+                .filter(e => e.status === st)
+                .sort((a, b) => a.currentName.localeCompare(b.currentName, 'de', { numeric: true, sensitivity: 'base' }));
+        });
+        return map;
+    }, [expandedFilenameStatus, renameInfo]);
 
-    // F22: Struktur-Check (aus dem früheren Strukturbericht übernommen)
+    // F29: Duplikate-Tab – Gruppen mit voraussichtlicher Aktion aufbereiten
+    const duplicateGroups = useMemo(() => {
+        const groups = structureResult?.duplicates || [];
+        return groups.map(g => {
+            const entries = g.ids.map(id => ({ id, entry: files[id] })).filter((x): x is { id: string; entry: DatabaseEntry } => !!x.entry);
+            const isOffline = (e: DatabaseEntry) => !!(e.missingSince || e.onlineMissingSince);
+            const online = entries.filter(x => !isOffline(x.entry));
+            const keptIds = new Set<string>();
+            if (online.length > 0) {
+                online.forEach(x => keptIds.add(x.id));
+            } else if (entries.length > 0) {
+                const sorted = [...entries].sort((a, b) => {
+                    const lenDiff = a.entry.filename.length - b.entry.filename.length;
+                    if (lenDiff !== 0) return lenDiff;
+                    return a.entry.timestamp - b.entry.timestamp;
+                });
+                keptIds.add(sorted[0].id);
+            }
+            const removableCount = entries.filter(x => !keptIds.has(x.id)).length;
+            return { hash: g.hash, entries, keptIds, removableCount, skipped: online.length > 0 && removableCount === 0 };
+        });
+    }, [structureResult, files]);
+    const duplicateRemovableTotal = duplicateGroups.reduce((s, g) => s + g.removableCount, 0);
+    const duplicateResolvableGroups = duplicateGroups.filter(g => g.removableCount > 0).length;
+
+    // F29: Führt die Bereinigung erst nach Bestätigung aus und zeigt danach den Erfolgs-Banner
+    const handleCleanFilenames = async () => {
+        if (!onCleanFilenames) return;
+        setCleanupRunning(true);
+        try {
+            const s = await onCleanFilenames();
+            const parts: string[] = [];
+            if (s.renamed > 0) parts.push(`${s.renamed} umbenannt (${s.doubleExt} Doppelendungen, ${s.extLowercased} Endungen klein)`);
+            if (s.removed > 0) parts.push(`${s.removed} Duplikate/Reste entfernt`);
+            if (s.failed > 0) parts.push(`${s.failed} fehlgeschlagen (siehe Log)`);
+            setAutoFixNotice(`✅ Bereinigt: ${parts.length > 0 ? parts.join(', ') : 'keine Änderungen nötig'}.`);
+            setTimeout(() => setAutoFixNotice(''), 8000);
+        } finally {
+            setCleanupRunning(false);
+            setShowCleanupDialog(false);
+            setShowCleanupList(false);
+        }
+    };
+
+    // F22: Struktur-Check (rein lesend; Dateiänderungen erst über „Dateinamen bereinigen“)
     const runStructureCheck = async () => {
         setStructureRunning(true);
-        awaitingResultRef.current = true;
         setAutoFixNotice('');
         try {
             const result = await window.electron.checkIntegrity(basePath, files, false);
@@ -247,6 +300,8 @@ export const CorrectionModal: React.FC<CorrectionModalProps> = ({
     const handleDeleteAllUntracked = async () => {
         if (!onDeleteUntrackedFile || untrackedFiles.length === 0) return;
         if (!confirm(`Wirklich alle ${untrackedFiles.length} verwaisten Dateien von der Festplatte löschen?`)) return;
+        // F28: Force-Backup vor der Batch-Löschung
+        if (onBeforeBulkDelete) await onBeforeBulkDelete();
         for (const f of [...untrackedFiles]) {
             const ok = await onDeleteUntrackedFile(f);
             if (ok) setUntrackedFiles(prev => prev.filter(x => x.path !== f.path));
@@ -261,14 +316,28 @@ export const CorrectionModal: React.FC<CorrectionModalProps> = ({
                 <div className="p-4 border-b border-slate-700 bg-slate-900 flex justify-between items-center gap-3 flex-wrap">
                     <div>
                         <h3 className="text-xl font-bold text-white flex items-center gap-2">🛠️ Prüfung & Korrekturen</h3>
-                        <div className="text-xs text-slate-400 mt-0.5">Struktur-Check läuft automatisch beim Öffnen · Datenbank, Dateisystem & Dateiinhalte</div>
+                        <div className="text-xs text-slate-400 mt-0.5">
+                            <span className="text-slate-200 font-bold">1.</span> Struktur prüfen →
+                            <span className="text-slate-200 font-bold"> 2.</span> Befunde sichten →
+                            <span className="text-slate-200 font-bold"> 3.</span> bereinigen (mit Bestätigung)
+                        </div>
                     </div>
                     <div className="flex items-center gap-2">
                         <button
+                            onClick={() => void runStructureCheck()}
+                            disabled={structureRunning}
+                            className={`bg-teal-600 hover:bg-teal-500 disabled:opacity-60 text-white px-4 py-2.5 rounded text-sm font-bold border border-teal-400 shadow-lg flex items-center gap-2 ${!structureResult && !structureRunning ? 'animate-pulse' : ''}`}
+                            title="Zuerst prüfen: Struktur/Hashes/verwaiste Dateien werden geprüft (ändert keine Dateien)"
+                        >
+                            {structureRunning
+                                ? <><span className="animate-spin rounded-full h-3.5 w-3.5 border-t-2 border-white inline-block"></span> Prüfe Struktur…</>
+                                : <>🔍 Struktur prüfen</>}
+                        </button>
+                        <button
                             onClick={() => setShowContentDialog(true)}
                             disabled={contentRunning}
-                            className="bg-purple-800 hover:bg-purple-700 disabled:opacity-50 text-white px-3 py-2 rounded text-xs border border-purple-600"
-                            title="Dateien vollständig lesen und auf Defekte prüfen"
+                            className="bg-slate-700 hover:bg-slate-600 disabled:opacity-50 text-slate-200 px-3 py-2.5 rounded text-xs border border-slate-500"
+                            title="Optional: Dateien vollständig lesen und auf Defekte prüfen (empfohlen nach der Strukturprüfung)"
                         >
                             💾 Inhalt prüfen
                         </button>
@@ -276,27 +345,24 @@ export const CorrectionModal: React.FC<CorrectionModalProps> = ({
                     </div>
                 </div>
 
-                {/* STATUSZEILE (Duplikate / Veraltet / letzter Check) */}
+                {/* STATUSZEILE (Prüfstatus / Veraltet) */}
                 <div className="px-4 py-2 bg-slate-900/60 border-b border-slate-700 flex items-center justify-between gap-3 flex-wrap text-xs">
-                    <div className="text-slate-400 flex items-center gap-2">
+                    <div className="flex items-center gap-2 flex-wrap">
                         {structureRunning
                             ? <span className="flex items-center gap-2 text-slate-200"><span className="animate-spin rounded-full h-3 w-3 border-t-2 border-slate-200 inline-block"></span> Prüfe Struktur…</span>
                             : structureResult
-                                ? <>Letzter Struktur-Check: Duplikate <span className={duplicateCount > 0 ? 'text-amber-400 font-bold' : 'text-slate-300'}>{duplicateCount}</span> · Veraltet <span className={legacyCount > 0 ? 'text-blue-400 font-bold' : 'text-slate-300'}>{legacyCount}</span></>
-                                : 'Struktur-Check fehlgeschlagen.'}
+                                ? <span className="text-slate-400">Struktur geprüft · Befunde in den Tabs · Veraltet <span className={legacyCount > 0 ? 'text-blue-400 font-bold' : 'text-slate-300'}>{legacyCount}</span></span>
+                                : <span className="text-amber-300 font-bold">Noch nicht geprüft – starte zuerst „🔍 Struktur prüfen“ (oben rechts).</span>}
                         {contentSummary && <span className="ml-2 text-slate-300">{contentSummary}</span>}
                     </div>
                     <div className="flex items-center gap-2">
-                        {duplicateCount > 0 && (
-                            <button onClick={onExecuteDuplicates} className="bg-amber-700 hover:bg-amber-600 text-white px-3 py-1 rounded text-[10px] font-bold">Duplikate bereinigen</button>
-                        )}
                         {legacyCount > 0 && onCleanLegacy && (
                             <button onClick={onCleanLegacy} className="bg-blue-700 hover:bg-blue-600 text-white px-3 py-1 rounded text-[10px] font-bold">Veraltete Felder bereinigen</button>
                         )}
                     </div>
                 </div>
 
-                {/* F26: Banner nach automatischer Bereinigung */}
+                {/* F29: Banner nach bestätigter Bereinigung */}
                 {autoFixNotice && (
                     <div className="px-4 py-2 bg-green-900/30 border-b border-green-800 text-xs text-green-200">
                         {autoFixNotice}
@@ -617,7 +683,7 @@ export const CorrectionModal: React.FC<CorrectionModalProps> = ({
                                 <div className="text-xs text-slate-400">Auf der Platte, aber in keinem DB-Eintrag</div>
                             </div>
                             <div className="bg-orange-900/10 border border-orange-900/30 p-3 rounded text-xs text-slate-300">
-                                Diese Dateien liegen in den Jahres-/Monatsordnern, sind aber keinem DB-Eintrag zugeordnet. Hash-identische „(n)“-Paare werden beim Struktur-Check automatisch aufgelöst (Duplikat gelöscht, Basisname behalten); übrige Reste können hier geprüft oder gelöscht werden.
+                                Diese Dateien liegen in den Jahres-/Monatsordnern, sind aber keinem DB-Eintrag zugeordnet. Hash-identische Duplikate werden beim Struktur-Check vorgemerkt und über „✨ Dateinamen bereinigen“ entfernt; eindeutige Dateien können hier geprüft oder gelöscht werden.
                             </div>
                             {untrackedCount > 0 ? (<>
                             <div className="border border-slate-700 rounded bg-slate-900/30 max-h-[300px] overflow-y-auto">
@@ -659,58 +725,193 @@ export const CorrectionModal: React.FC<CorrectionModalProps> = ({
                             <div className="flex justify-end mt-1">
                                 <button onClick={handleDeleteAllUntracked} className="bg-orange-800 hover:bg-orange-700 text-white px-4 py-2 rounded text-sm font-bold shadow border border-orange-600">Alle {untrackedCount} löschen</button>
                             </div>
-                            </>) : (<TabEmpty text={structureResult ? 'Keine verwaisten Dateien gefunden.' : 'Wird geprüft…'} />)}
+                            </>) : (<TabEmpty text={structureResult ? 'Keine verwaisten Dateien gefunden.' : 'Noch nicht geprüft – bitte „🔍 Struktur prüfen“ starten.'} />)}
                         </div>
                     )}
 
-                    {/* --- SECTION 6: DATEINAMEN (F24, nur Info) --- */}
-                    {activeTab === 'filenames' && (
+                    {/* --- SECTION 7: DUPLIKATE (F29: DB-Einträge mit identischem Inhalt) --- */}
+                    {activeTab === 'duplicates' && (
                         <div className="flex flex-col gap-2">
                             <div className="flex justify-between items-center pb-2 border-b border-slate-700">
-                                <h4 className="text-lg font-bold text-teal-400">Dateinamen-Prüfung</h4>
-                                <div className="text-xs text-slate-400">Nur Information – Bereinigung läuft automatisch</div>
+                                <h4 className="text-lg font-bold text-fuchsia-400">🔁 Duplikate ({duplicateCount})</h4>
+                                <div className="text-xs text-slate-400">DB-Einträge mit identischem Dateiinhalt (SHA-256)</div>
                             </div>
-                            <div className="bg-teal-900/10 border border-teal-900/30 p-3 rounded text-xs text-slate-300">
-                                Geprüft werden Dateien mit Zähler im Namen („Name (n).ext“). Sichere Umbenennungen und hash-identische Duplikate werden automatisch erledigt; Kollisionen sind zwei verschiedene Fotos mit gleichem Namen und bleiben beide erhalten.
+                            <div className="bg-fuchsia-900/10 border border-fuchsia-900/30 p-3 rounded text-xs text-slate-300">
+                                Mehrere Google-Fotos in der Datenbank haben denselben Dateiinhalt. Beim Bereinigen werden <strong>Online-Einträge nie gelöscht</strong>: Sind Online-Einträge dabei, verschwinden nur Offline-Kopien; sind alle offline, bleibt der kürzeste Name (bei Gleichstand der älteste). Dateien <strong>ohne DB-Eintrag</strong> („Duplikat von …“) stehen dagegen im Tab <strong>Verwaist</strong>.
                             </div>
-
-                            {!renameInfo ? (
-                                <TabEmpty text={structureRunning ? 'Prüfe Dateinamen…' : 'Keine Daten – Struktur-Check fehlgeschlagen.'} />
+                            {duplicateGroups.length === 0 ? (
+                                <TabEmpty text={structureResult ? 'Keine Duplikate gefunden.' : 'Noch nicht geprüft – bitte „🔍 Struktur prüfen“ starten.'} />
                             ) : (
                                 <>
-                                    <div className="text-[10px] text-slate-500">
-                                        Namen mit „(n)“: {renameInfo.stats?.nTotal || 0} · Geschützt: {renameInfo.stats?.legitNames || 0} · Automatisch erledigt: {renameInfo.autoRenamed || 0} umbenannt / {renameInfo.autoResolved || 0} aufgelöst · Kollisionen: {renameInfo.stats?.collisionPair || 0} · Ohne Originalname: {renameInfo.stats?.noName || 0} · Namensabweichung: {renameInfo.stats?.nameMismatch || 0} · Datei fehlt: {renameInfo.stats?.currentMissing || 0}
-                                    </div>
-
-                                    {renameDisplayEntries.length === 0 ? (
-                                        <TabEmpty text="Keine Einzel-Auffälligkeiten (geschützt/ohne Name/Abweichung/Kollision)." />
-                                    ) : (
-                                        <div className="border border-slate-700 rounded bg-slate-900/30 max-h-[300px] overflow-y-auto">
+                                <div className="flex flex-col gap-3">
+                                    {duplicateGroups.map((g, gi) => (
+                                        <div key={gi} className="border border-slate-700 rounded bg-slate-900/30">
+                                            <div className="px-3 py-2 bg-slate-900/60 border-b border-slate-700 text-[10px] font-mono text-slate-400 flex justify-between gap-2 flex-wrap">
+                                                <span>Gruppe {gi + 1} · {g.entries.length} Einträge · Hash {g.hash.slice(0, 12)}…</span>
+                                                {g.removableCount === 0
+                                                    ? <span className="text-amber-300 font-bold">wird übersprungen – alle Einträge online</span>
+                                                    : <span className="text-red-300 font-bold">{g.removableCount} Datei(en) werden gelöscht</span>}
+                                            </div>
                                             <table className="w-full text-left text-xs text-slate-300">
-                                                <thead className="bg-slate-800 text-slate-400 uppercase font-bold sticky top-0">
+                                                <thead className="bg-slate-800 text-slate-400 uppercase font-bold">
                                                     <tr>
                                                         <th className="p-2">Dateiname</th>
-                                                        <th className="p-2">Originalname</th>
+                                                        <th className="p-2">Ordner</th>
                                                         <th className="p-2">Status</th>
+                                                        <th className="p-2">Voraussichtliche Aktion</th>
                                                     </tr>
                                                 </thead>
                                                 <tbody>
-                                                    {renameDisplayEntries.map((e, i) => (
-                                                        <tr key={i} className="border-b border-slate-700 hover:bg-slate-800/50">
-                                                            <td className="p-2 font-mono text-white break-all">{e.currentName}</td>
-                                                            <td className="p-2 font-mono text-slate-400 break-all">{e.originalName || '—'}</td>
-                                                            <td className="p-2 whitespace-nowrap">
-                                                                {e.status === 'protected' && <span className="text-slate-400">Geschützt (echter Google-Name)</span>}
-                                                                {e.status === 'noName' && <span className="text-amber-300">Kein Originalname gespeichert</span>}
-                                                                {e.status === 'nameMismatch' && <span className="text-orange-300">Originalname passt nicht zum Basisnamen</span>}
-                                                                {e.status === 'collision' && <span className="text-red-300">Kollision – „{e.newName}“ ist ein anderes Foto (anderer Inhalt)</span>}
-                                                            </td>
-                                                        </tr>
-                                                    ))}
+                                                    {g.entries.map(e => {
+                                                        const d = new Date(e.entry.timestamp);
+                                                        const kept = g.keptIds.has(e.id);
+                                                        return (
+                                                            <tr key={e.id} className="border-b border-slate-700 hover:bg-slate-800/50">
+                                                                <td className="p-2 font-mono text-white break-all">{e.entry.filename}</td>
+                                                                <td className="p-2 text-slate-400 whitespace-nowrap">{d.getFullYear()}/{(d.getMonth() + 1).toString().padStart(2, '0')}</td>
+                                                                <td className="p-2 whitespace-nowrap">
+                                                                    {e.entry.missingSince
+                                                                        ? <span className="text-amber-300">Vermisst</span>
+                                                                        : e.entry.onlineMissingSince
+                                                                            ? <span className="text-violet-300">Online nicht gefunden</span>
+                                                                            : <span className="text-green-300">Online</span>}
+                                                                </td>
+                                                                <td className="p-2 whitespace-nowrap">
+                                                                    {kept
+                                                                        ? <span className="text-green-300">behalten</span>
+                                                                        : <span className="text-red-300">wird gelöscht</span>}
+                                                                </td>
+                                                            </tr>
+                                                        );
+                                                    })}
                                                 </tbody>
                                             </table>
                                         </div>
-                                    )}
+                                    ))}
+                                </div>
+                                <div className="flex justify-end items-center gap-3 mt-1">
+                                    <button
+                                        onClick={onExecuteDuplicates}
+                                        disabled={duplicateRemovableTotal === 0}
+                                        className="bg-fuchsia-800 hover:bg-fuchsia-700 disabled:opacity-50 disabled:cursor-not-allowed text-white px-4 py-2 rounded text-sm font-bold shadow border border-fuchsia-600"
+                                        title={duplicateRemovableTotal === 0 ? 'Alle Gruppen sind komplett online – es gibt nichts zu löschen.' : 'Entfernt nur Offline-Kopien (Online-Einträge bleiben immer erhalten); zuvor wird ein DB-Backup erstellt.'}
+                                    >
+                                        🗑 Duplikate bereinigen ({duplicateRemovableTotal} Dateien in {duplicateResolvableGroups} Gruppen)
+                                    </button>
+                                </div>
+                                </>
+                            )}
+                        </div>
+                    )}
+
+                    {/* --- SECTION 6: DATEINAMEN (F24/F29: prominente Stats + Lazy-Klapplisten) --- */}
+                    {activeTab === 'filenames' && (
+                        <div className="flex flex-col gap-3">
+                            <div className="flex justify-between items-center pb-2 border-b border-slate-700">
+                                <h4 className="text-lg font-bold text-teal-400">Dateinamen-Prüfung</h4>
+                                <div className="text-xs text-slate-400">Nur Information – Ausführung über „✨ Dateinamen bereinigen“</div>
+                            </div>
+                            <div className="bg-teal-900/10 border border-teal-900/30 p-3 rounded text-xs text-slate-300">
+                                Geprüft werden Dateien mit Zähler im Namen („Name (n).ext“) sowie doppelte und großgeschriebene Endungen (z. B. „IMG_3181.JPG.jpg“, „IMG_2851.JPG“). Umbenennungen und hash-identische Duplikate werden vorgemerkt und erst nach Bestätigung ausgeführt; Kollisionen (zwei verschiedene Fotos mit gleichem Namen) bleiben unangetastet.
+                            </div>
+
+                            {!renameInfo ? (
+                                <TabEmpty text={structureRunning ? 'Prüfe Dateinamen…' : 'Noch nicht geprüft – bitte „🔍 Struktur prüfen“ starten.'} />
+                            ) : (
+                                <>
+                                    {/* F29: prominente Statistik */}
+                                    <div className="bg-slate-900/60 border border-teal-800/50 rounded-lg p-4 flex flex-col gap-3">
+                                        <div className="flex items-end justify-between gap-4 flex-wrap">
+                                            <div className="flex items-end gap-4 flex-wrap">
+                                                <div>
+                                                    <div className="text-[10px] uppercase tracking-widest text-teal-400 font-bold">Vorgemerkt für Bereinigung</div>
+                                                    <div className="text-3xl font-extrabold text-teal-300 leading-none mt-1">{cleanupTotal}</div>
+                                                </div>
+                                                <div className="flex gap-2 flex-wrap text-[11px] pb-0.5">
+                                                    <span className="bg-teal-900/40 border border-teal-700/50 text-teal-200 px-2 py-0.5 rounded-full">{cleanupSuffixCount} × „(n)“</span>
+                                                    <span className="bg-teal-900/40 border border-teal-700/50 text-teal-200 px-2 py-0.5 rounded-full">{cleanupDoubleExtCount} × Doppelendung</span>
+                                                    <span className="bg-teal-900/40 border border-teal-700/50 text-teal-200 px-2 py-0.5 rounded-full">{cleanupExtLowerCount} × Endung klein</span>
+                                                    <span className="bg-teal-900/40 border border-teal-700/50 text-teal-200 px-2 py-0.5 rounded-full">{cleanupResolveCount + cleanupDeleteCount} × Duplikate/Reste</span>
+                                                </div>
+                                            </div>
+                                            {cleanupTotal > 0 && onCleanFilenames ? (
+                                                <button
+                                                    onClick={() => { setShowCleanupDialog(true); setShowCleanupList(false); }}
+                                                    className="bg-teal-600 hover:bg-teal-500 text-white px-4 py-2 rounded text-sm font-bold shadow border border-teal-400"
+                                                    title="Vorgemerkte Umbenennungen/Löschungen nach Bestätigung ausführen"
+                                                >
+                                                    ✨ Dateinamen bereinigen ({cleanupTotal})
+                                                </button>
+                                            ) : (
+                                                <span className="text-[11px] text-slate-500 pb-1">Nichts zu bereinigen.</span>
+                                            )}
+                                        </div>
+                                        <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-2">
+                                            <div className="bg-slate-800/80 border border-slate-700 rounded p-2 text-center">
+                                                <div className="text-[10px] uppercase tracking-wider text-slate-400 font-bold">Namen mit „(n)“</div>
+                                                <div className="text-xl font-bold text-slate-200">{renameInfo.stats?.nTotal || 0}</div>
+                                            </div>
+                                            {([
+                                                { key: 'protected', label: 'Geschützt', value: renameInfo.stats?.legitNames || 0, color: 'text-slate-200', hint: 'Echter Google-Name – wird nicht umbenannt (Endung ggf. klein).' },
+                                                { key: 'collision', label: 'Kollisionen', value: renameInfo.stats?.collisionPair || 0, color: (renameInfo.stats?.collisionPair || 0) > 0 ? 'text-red-300' : 'text-slate-400', hint: 'Zielname ist durch ein anderes Foto belegt – bleibt unangetastet.' },
+                                                { key: 'nameMismatch', label: 'Namensabweichung', value: renameInfo.stats?.nameMismatch || 0, color: (renameInfo.stats?.nameMismatch || 0) > 0 ? 'text-amber-300' : 'text-slate-400', hint: 'Gespeicherter Originalname passt nicht (z. B. Altbestand).' },
+                                                { key: 'noName', label: 'Ohne Originalname', value: renameInfo.stats?.noName || 0, color: (renameInfo.stats?.noName || 0) > 0 ? 'text-amber-300' : 'text-slate-400', hint: 'Kein Originalname in der DB gespeichert.' },
+                                            ] as const).map(t => (
+                                                <button
+                                                    key={t.key}
+                                                    onClick={() => setExpandedFilenameStatus(prev => ({ ...prev, [t.key]: !prev[t.key] }))}
+                                                    className={`border rounded p-2 text-center transition ${expandedFilenameStatus[t.key] ? 'bg-teal-900/40 border-teal-500' : 'bg-slate-800/80 border-slate-700 hover:border-teal-600'}`}
+                                                    title={`${t.hint} Klicken zum ${expandedFilenameStatus[t.key] ? 'Ausblenden' : 'Anzeigen'}.`}
+                                                >
+                                                    <div className="text-[10px] uppercase tracking-wider text-slate-400 font-bold">{t.label} <span className="text-slate-500">{expandedFilenameStatus[t.key] ? '▲' : '▼'}</span></div>
+                                                    <div className={`text-xl font-bold ${t.color}`}>{t.value}</div>
+                                                </button>
+                                            ))}
+                                            <div className="bg-slate-800/80 border border-slate-700 rounded p-2 text-center">
+                                                <div className="text-[10px] uppercase tracking-wider text-slate-400 font-bold">Datei fehlt</div>
+                                                <div className={`text-xl font-bold ${(renameInfo.stats?.currentMissing || 0) > 0 ? 'text-red-300' : 'text-slate-400'}`}>{renameInfo.stats?.currentMissing || 0}</div>
+                                            </div>
+                                        </div>
+                                        {anyFilenameExpanded && (
+                                            <button onClick={() => setExpandedFilenameStatus({})} className="self-start text-[10px] text-slate-400 hover:text-white underline">Alle Listen ausblenden</button>
+                                        )}
+                                    </div>
+
+                                    {/* F29: Lazy-Listen je Status (Filter/Sortierung erst beim Ausklappen) */}
+                                    {([
+                                        { key: 'collision', label: 'Kollisionen', hint: (e: RenameCheckEntry) => `Zielname „${e.newName}“ ist belegt (anderes Foto)` },
+                                        { key: 'nameMismatch', label: 'Namensabweichung', hint: () => 'Originalname passt nicht zum Basisnamen' },
+                                        { key: 'noName', label: 'Ohne Originalname', hint: () => 'Kein Originalname gespeichert' },
+                                        { key: 'protected', label: 'Geschützt', hint: () => 'Echter Google-Name – geschützt' },
+                                    ] as const).map(g => {
+                                        if (!expandedFilenameStatus[g.key]) return null;
+                                        const rows = filenameEntriesByStatus[g.key] || [];
+                                        return (
+                                            <div key={g.key} className="flex flex-col gap-1">
+                                                <div className="text-xs font-bold text-teal-300">{g.label} ({rows.length})</div>
+                                                <div className="border border-slate-700 rounded bg-slate-900/30 max-h-[400px] overflow-y-auto">
+                                                    <table className="w-full text-left text-xs text-slate-300">
+                                                        <thead className="bg-slate-800 text-slate-400 uppercase font-bold sticky top-0">
+                                                            <tr>
+                                                                <th className="p-2">Dateiname</th>
+                                                                <th className="p-2">Originalname</th>
+                                                                <th className="p-2">Hinweis</th>
+                                                            </tr>
+                                                        </thead>
+                                                        <tbody>
+                                                            {rows.map((e, i) => (
+                                                                <tr key={i} className="border-b border-slate-700 hover:bg-slate-800/50">
+                                                                    <td className="p-2 font-mono text-white break-all">{e.currentName}</td>
+                                                                    <td className="p-2 font-mono text-slate-400 break-all">{e.originalName || '—'}</td>
+                                                                    <td className="p-2 whitespace-nowrap">{g.hint(e)}</td>
+                                                                </tr>
+                                                            ))}
+                                                        </tbody>
+                                                    </table>
+                                                </div>
+                                            </div>
+                                        );
+                                    })}
                                 </>
                             )}
                         </div>
@@ -727,6 +928,78 @@ export const CorrectionModal: React.FC<CorrectionModalProps> = ({
                         Schließen
                     </button>
                 </div>
+
+                {/* F29: Bestätigungsdialog für die Dateinamen-Bereinigung (Liste lazy) */}
+                {showCleanupDialog && (
+                    <div className="absolute inset-0 bg-black/80 z-20 flex items-center justify-center rounded-lg p-6">
+                        <div className="bg-slate-800 border border-slate-600 rounded-lg shadow-2xl max-w-2xl w-full max-h-[85vh] flex flex-col">
+                            <div className="p-4 border-b border-slate-700 bg-slate-900">
+                                <h4 className="text-lg font-bold text-white">✨ Dateinamen bereinigen</h4>
+                                <div className="text-xs text-slate-400 mt-0.5">Vor der Ausführung wird automatisch ein DB-Backup erstellt.</div>
+                            </div>
+                            <div className="p-4 overflow-y-auto flex flex-col gap-3 text-sm text-slate-200">
+                                <ul className="list-disc list-inside flex flex-col gap-1">
+                                    <li><strong>{cleanupRenameCount}</strong> Datei(en) umbenennen ({cleanupSuffixRenameCount} × „(n)“, {cleanupDoubleExtCount} × Doppelendung, {cleanupExtLowerCount} × Endung kleinschreiben)</li>
+                                    <li><strong>{cleanupResolveCount + cleanupDeleteCount}</strong> Duplikat(e)/Kollisionsrest(e) entfernen ({cleanupResolveCount} getrackte „(n)“-Auflösungen, {cleanupDeleteCount} verwaiste Duplikate)</li>
+                                </ul>
+                                <div className="text-xs text-slate-400">
+                                    Echte Kollisionen (anderer Inhalt), fehlende Dateien und Hash-Abweichungen werden nicht angetastet und beim nächsten Check erneut angeboten.
+                                </div>
+                                <button
+                                    onClick={() => setShowCleanupList(v => !v)}
+                                    className="self-start bg-slate-700 hover:bg-slate-600 text-slate-200 px-3 py-1 rounded text-xs"
+                                >
+                                    {showCleanupList ? '📋 Liste ausblenden' : `📋 Liste anzeigen (${cleanupTotal})`}
+                                </button>
+                                {showCleanupList && (
+                                    <div className="border border-slate-700 rounded bg-slate-900/40 max-h-[300px] overflow-y-auto">
+                                        <table className="w-full text-left text-[11px] text-slate-300">
+                                            <thead className="bg-slate-800 text-slate-400 uppercase font-bold sticky top-0">
+                                                <tr>
+                                                    <th className="p-2">Aktion</th>
+                                                    <th className="p-2">Datei</th>
+                                                    <th className="p-2">Ziel</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                {cleanupItems.slice(0, 500).map((it, i) => (
+                                                    <tr key={i} className="border-b border-slate-700">
+                                                        <td className="p-2 whitespace-nowrap">
+                                                            {it.kind === 'rename' && (it.reason === 'doubleExt' ? 'Doppelendung' : it.reason === 'extLowercase' ? 'Endung klein' : 'Umbenennen')}
+                                                            {it.kind === 'resolve' && 'DB → Basis + löschen'}
+                                                            {it.kind === 'delete' && 'Löschen'}
+                                                        </td>
+                                                        <td className="p-2 font-mono break-all">{it.from}</td>
+                                                        <td className="p-2 font-mono break-all">{it.to || '—'}</td>
+                                                    </tr>
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                        {cleanupItems.length > 500 && (
+                                            <div className="p-2 text-[10px] text-slate-500">… und {cleanupItems.length - 500} weitere (werden trotzdem ausgeführt).</div>
+                                        )}
+                                    </div>
+                                )}
+                            </div>
+                            <div className="p-4 border-t border-slate-700 flex justify-end gap-3 bg-slate-900 rounded-b-lg">
+                                <button
+                                    onClick={() => { setShowCleanupDialog(false); setShowCleanupList(false); }}
+                                    disabled={cleanupRunning}
+                                    className="bg-slate-700 hover:bg-slate-600 text-white px-4 py-2 rounded text-sm"
+                                >
+                                    Abbrechen
+                                </button>
+                                <button
+                                    onClick={() => void handleCleanFilenames()}
+                                    disabled={cleanupRunning}
+                                    className="bg-teal-700 hover:bg-teal-600 disabled:opacity-50 text-white px-4 py-2 rounded text-sm font-bold"
+                                >
+                                    {cleanupRunning ? 'Bereinige…' : 'Ausführen (erstellt DB-Backup)'}
+                                </button>
+                            </div>
+                        </div>
+                    </div>
+                )}
 
                 {/* F26: Auswahl-Dialog für den Inhalts-Check */}
                 {showContentDialog && (

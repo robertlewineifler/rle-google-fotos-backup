@@ -96,6 +96,7 @@ dist/, release/              Build-Artefakte (via .gitignore ausgeschlossen)
    - `/album/` oder `/share/` → öffnet stattdessen den **AlbumDownloadModal**.
    - sonst: `/photo/` muss enthalten sein, sonst Fehler „Bitte öffne zuerst ein Bild!“.
 3. `runBackupSession(false)` startet den Loop:
+   - **F28-Tages-Backup:** Vor dem ersten Scan des Kalendertags wird (nur Haupt-Backup) einmalig ein DB-Backup erstellt, falls für heute noch keins existiert (`backupDatabase('daily', 'Tagesstart')`). Album-Modus: kein Backup (keine DB-Einträge).
    - **F1.4-Start:** Aktuelles Foto per `loadURL` neu laden, ~1,2 s warten, Panel-Öffnungs-Check (falls nötig `i`, max. 3 Runden; bei `null`-Scrape nicht togglen), dann initiale Panel-Stabilisierung. (Album-Modus: weiterhin nur `toggleInfoPanel` + 1 s.)
    - Schleifenbedingung: `isWalkingRef.current === true`.
    - **Parallelitätsgrenze:** max. 5 aktive Downloads (`activeDownloadsRef >= 5` → 500 ms warten).
@@ -150,6 +151,7 @@ dist/, release/              Build-Artefakte (via .gitignore ausgeschlossen)
   - Album (`flatStructure: true`): direkt `<targetDir>/` (also z. B. `…/Alben/Urlaub_2024/`)
 - **Dateinamen-Sanitizing:**
   - Endung wird **case-insensitiv** abgetrennt und in Kleinbuchstaben normalisiert (`.MP4` → `.mp4`).
+  - **F29: Doppelte Endungen werden entfernt** (Google liefert z. B. `IMG_3181.JPG.jpg` → `IMG_3181.jpg`; `while`-Schleife vor der Kollisionsprüfung).
   - Basisname auf **100 Zeichen** gekürzt (Google liefert teils Beschreibungen als Namen).
   - Kollisionen im Zielordner: `Name (1).ext`, `Name (2).ext`, … (Zähler-Schleife, `fs.existsSync` **und** `reservedTargetPaths`-Set, F5). Das Set reserviert gewählte Pfade, solange der Download läuft (Datei existiert erst nach `setSavePath`/Downloadstart), und wird im `done`-Handler wieder freigegeben → parallele Gleichnamige können sich nicht überschreiben. Auch die ZIP-Extraktion nutzt die Reservierung.
 - Log-Einträge: Download-Start mit id/Datei/Ordner/Web-Datum/trusted; Abschluss mit Source-/File-Hash-Prefix.
@@ -157,6 +159,7 @@ dist/, release/              Build-Artefakte (via .gitignore ausgeschlossen)
 ### 5.2 ZIP-Handling (Live Photos)
 - Nur bei `.zip`: `adm-zip` sucht den ersten Eintrag (nicht Ordner, kein `__macosx`) mit `.jpg`/`.jpeg`.
 - Bild wird entpackt, Kollisionen erhalten `(n)`, das ZIP wird gelöscht (best effort), `savePath`/`finalFilename`/`ext` werden auf das Bild umgestellt.
+- **F29:** Der extrahierte Bildname bekommt **immer** eine kleingeschriebene Endung (früher wurde die Original-Schreibweise übernommen → 3.580 Einträge mit `.JPG`).
 - Fehler beim Entpacken: Download gilt trotzdem als erfolgreich, ZIP bleibt liegen.
 
 ### 5.3 Metadaten
@@ -212,8 +215,11 @@ dist/, release/              Build-Artefakte (via .gitignore ausgeschlossen)
 - `skippedDownloads` (F10): Fotos, deren Download-Start nicht innerhalb von 45 s bestätigt wurde (Key = **Google Photo ID**). Quelle der Sektion „Übersprungen“ im Korrektur-Modal; wird bei erfolgreichem Download/„Ignorieren“ entfernt und beim Laden gegen `files` bereinigt (selbstheilend). Einträge besitzen bewusst **keinen** `files`-Eintrag.
 
 ### 6.2 Speichern & Backups
-- `saveDatabase` ruft IPC `save-database`; dieses schreibt `JSON.stringify(data, null, 2)` und ruft vorher `maybeBackupDatabase`.
-- **DB-Backups:** `maybeBackupDatabase` kopiert höchstens **alle 10 Minuten** nach `<DB-Ordner>/Backups/gphotos_db_<YYYY-MM-DD_HHMMSS>.json`; es werden max. **20** Backups behalten (älteste werden gelöscht).
+- `saveDatabase` ruft IPC `save-database`; dieses schreibt `JSON.stringify(data, null, 2)` — **kein Auto-Backup mehr** (F28; früher `maybeBackupDatabase` mit 10-Minuten-Drossel).
+- **DB-Backups (F28):** IPC `create-db-backup` kopiert nach `<DB-Ordner>/Backups/gphotos_db_<YYYY-MM-DD_HHMMSS>.json` (Kollisionssuffix `_n` bei gleicher Sekunde); max. **20** Backups, älteste werden rotiert. Zwei Modi:
+  - `daily` (Frontend `backupDatabase('daily', 'Tagesstart')` am Anfang jeder Haupt-Backup-Session): erstellt nur, wenn für den heutigen **Kalendertag** noch kein Backup existiert → im Notfall geht höchstens der Fortschritt des aktuellen Kalendertags verloren.
+  - `force` (vor irreversiblen Bulk-Aktionen: Duplikate bereinigen, Vermisste-Cleanup, „Alle löschen“ bei Defekt/OnlineMissing/Verwaist, Legacy-Bereinigung, „✨ Dateinamen bereinigen“, Hash-Migration): immer.
+  - Wiederherstellung ist **manuell** (Backup-JSON zurück nach `gphotos_db.json` kopieren).
 - Speichern passiert u. a.: nach Download-Complete nicht, sondern bei Trigger `saveDatabase()` (Integrität, Rename, Korrekturen, **Download-Checkpoint alle 25**, Tageswechsel, Stop, Session-Ende).
 
 ### 6.3 Hash-Gate (wichtigstes Sicherheitskonzept)
@@ -257,7 +263,7 @@ Schreibt `YYYY:MM:DD HH:MM:SS` in:
 - Ergebnis wird im Frontend in die DB übernommen (Hashes, Größen), `missing` sofort als `missingSince` markiert, dann DB-Speichern.
 - **F17-Selbstheilung:** Einträge mit `missingSince`, die **nicht** in `result.missing` stehen (Datei wieder vorhanden), verlieren das Flag (Log „Vermisst-Status zurückgesetzt…“); `updateOrphansList()` läuft danach **immer** (auch bei 0 neuen Missing-Einträgen), damit die Korrektur-Liste nie veraltet bleibt.
 - **F21-Untracked-Scan:** Zusätzlich werden die Ordner `<basePath>/<YYYY>/<MM>/` nach Dateien durchsucht, die in **keinem** DB-Eintrag referenziert sind (`untracked` in `IntegrityResult`). Alben/Backups/Logs sind ausgenommen (nur 4-stellige Jahres-/2-stellige Monatsordner). Für jede verwaiste Datei wird der SHA-256 berechnet und mit bekannten Hashes verglichen → `duplicateOf` („Duplikat von <Datei>“) bzw. `trackedDuplicate` (Basisdatei, während die DB auf `Name (n).ext` zeigt). Angezeigt im Tab **„Verwaist“** des Fensters „Prüfung & Korrekturen“ (F22) mit Explorer/Anzeigen/Löschen (Löschen nutzt das bestehende `delete-file`-IPC, kein neuer Kanal).
-- **F23-Auto-Auflösung:** Hash-identische Namenspaare werden beim Struktur-Check **automatisch** bereinigt (kein Button): Zeigt die DB auf `Name (n).ext` und die Basisdatei liegt untracked vor, wird der DB-Eintrag auf `Name.ext` umgestellt, gespeichert und danach `Name (n).ext` gelöscht; ist umgekehrt die `(n)`-Datei untracked (hash-identisch), wird sie gelöscht. Fehlschläge bleiben mit Hinweis im Tab „Verwaist“.
+- **F23-Auflösung (seit F29 nur nach Bestätigung):** Hash-identische Namenspaare werden **vorgemerkt** und erst über „✨ Dateinamen bereinigen“ (nach Bestätigung, mit Force-Backup) bereinigt: Zeigt die DB auf `Name (n).ext` und die Basisdatei liegt untracked vor, wird der DB-Eintrag auf den Basisnamen umgestellt und danach `Name (n).ext` gelöscht; ist umgekehrt die `(n)`-Datei untracked (hash-identisch), wird sie gelöscht. Fehlschläge bleiben mit Hinweis im Tab „Verwaist“.
 
 ### 8.2 Inhalts-Check / Deep Scan (IPC `verify-file-integrity-batch` / „💾 Inhalt prüfen“)
 - Chunks von **100** Dateien (F15); pro Datei:
@@ -266,28 +272,32 @@ Schreibt `YYYY:MM:DD HH:MM:SS` in:
   - `ENOENT` wird ignoriert (Missing macht der Struktur-Check).
 - Gestartet über den Kopf-Button „💾 Inhalt prüfen“ im Fenster „Prüfung & Korrekturen“; der Klick öffnet einen Auswahl-Dialog („⚡ Nur Ungeprüfte/Defekte (X)“ vs. „🔍 Alles neu scannen (N)“ mit Erklärung). Währenddessen Overlay mit Fortschritt. Ergebnis setzt `integrityStatus` + `integrityCheckedAt` in der DB (Silent Save); defekte Dateien erscheinen im Tab „Defekt“.
 
-### 8.3 Fenster „Prüfung & Korrekturen“ (F22/F26, zusammengeführt)
-Ein Modal mit **sechs Tabs** (oben, mit Zählern) und einer Statuszeile; vereint Strukturbericht, Korrekturen und Dateinamen-Prüfung:
-- **Öffnen startet automatisch den Struktur-Check** (F26, inkl. F23/F24-Automatik); der frühere „Struktur prüfen“-Button ist entfernt.
-- **Kopfzeile:** „💾 Inhalt prüfen“ (öffnet Auswahl-Dialog), „✕“. **Statuszeile:** „Prüfe Struktur…“ (Spinner) bzw. letzter Check (Duplikate/Veraltet) + Inhaltsprüfungs-Ergebnis; Buttons „Duplikate bereinigen“ / „Veraltete Felder bereinigen“ (nur bei n > 0). **Auto-Banner (F26):** Wurden beim Check Duplikate/Kollisionsreste entfernt oder Dateien umbenannt, erscheint kurz „✅ Automatisch bereinigt: …“ (8 s).
+### 8.3 Fenster „Prüfung & Korrekturen“ (F22/F26/F29, zusammengeführt)
+Ein Modal mit **sieben Tabs** (oben, mit Zählern); vereint Strukturbericht, Korrekturen, Dateinamen-Prüfung und Duplikate:
+- **Kein Auto-Start mehr (F29):** Das Öffnen löst **keinen** Struktur-Check aus. Der **prominente Primär-Button „🔍 Struktur prüfen“** sitzt in der Kopfzeile neben dem sekundären „💾 Inhalt prüfen“ (pulsiert, bis ein Ergebnis vorliegt; weiche Führung – Inhalt prüfen bleibt klickbar). Untertitel: „1. Struktur prüfen → 2. Befunde sichten → 3. bereinigen (mit Bestätigung)“. Der Check ist **rein lesend** (Dateien werden nie verändert): Er aktualisiert nur DB-Metadaten (Hashes, Größen, Vermisst-Status) und füllt Tabs + Vorschau.
+- **Statuszeile:** vor dem ersten Check amber Hinweis „Noch nicht geprüft – starte zuerst ‚🔍 Struktur prüfen‘“, währenddessen „Prüfe Struktur…“ (Spinner), danach „Struktur geprüft · Befunde in den Tabs · Veraltet n“ + Inhaltsprüfungs-Ergebnis; rechts nur noch „Veraltete Felder bereinigen (n)“. **Kein Duplikat-Zähler/-Button mehr** (Duplikate sind ein eigener Tab), **„✨ Dateinamen bereinigen (n)“ sitzt im Dateinamen-Tab** (prominent neben „Vorgemerkt“; „Nichts zu bereinigen“, wenn leer).
+- **F29-Bestätigungsdialog:** „✨ Dateinamen bereinigen“ zeigt zuerst die Zusammenfassung (Umbenennungen/Entferntes) + Hinweis „DB-Backup wird erstellt“; die Detail-Liste „Altname → Neuname“ wird **erst auf Klick** gerendert (Lazy, max. 500 Zeilen). Erst „Ausführen“ startet die Bereinigung (Force-Backup → Hash-Gate → DB-Speichern) und zeigt danach den Erfolgs-Banner „✅ Bereinigt: …“ (8 s).
 - **Einheitlicher Tab-Aufbau (F26):** Jeder Tab zeigt immer Kopfzeile (Icon/Name/Anzahl + Unterzeile) und Erklärungsbox; darunter Liste + Aktionen oder „Keine Einträge in dieser Kategorie.“.
 - **Tab „Vermisst“:** aus DB löschen (Cleanup), „Status zurücksetzen“ oder „🌐 Web öffnen“ (`https://photos.google.com/photo/<id>`; Modal schließt).
 - **Tab „Defekt“:** „🗑 Löschen“ entfernt die Datei **physisch**, der DB-Eintrag bleibt bewusst bestehen (ohne `integrityStatus`/`hash`) → beim nächsten Backup neu laden; „Alle von Festplatte löschen“ als Batch; pro Zeile „📂 Explorer“ und „🖼️ Anzeigen“ (F16).
 - **Tab „Übersprungen“ (F10):** „🌐 Web öffnen“ lädt `photo/<id>` im Webview (danach „⬇ 1“ ohne Zeitlimit), „✖ Ignorieren“/„Alle ignorieren“ entfernt den Eintrag aus `skippedDownloads`.
 - **Tab „Online nicht gefunden“ (F13/F27):** pro Zeile „🌐 Web öffnen“ (ausgegraut, da online meist nicht mehr vorhanden – bewusst weiterhin klickbar), „📂 Explorer“, „🖼️ Anzeigen“, **„🗑 Löschen“ (einzeln, F27: Datei + DB-Eintrag)**; Batch „Status zurücksetzen (Behalten)“ und „Alle lokal löschen“ (F7-Muster).
-- **Tab „Verwaist“ (F21):** verwaiste Dateien aus dem letzten Struktur-Check, pro Zeile „📂 Explorer“, „🖼️ Anzeigen“, „🗑 Löschen“; Batch „Alle löschen“. Hash-identische `(n)`-Paare werden bereits automatisch beim Check aufgelöst (F23); Basisdateien mit fehlgeschlagener Auflösung haben keinen Löschen-Button.
-- **Tab „Dateinamen“ (F24, read-only):** kompakte Stats-Zeile (inkl. „Automatisch erledigt“) und Einzelzeilen nur für `protected`, `noName`, `nameMismatch`, `collision` (keine Buttons).
+- **Tab „Verwaist“ (F21):** verwaiste Dateien aus dem letzten Struktur-Check, pro Zeile „📂 Explorer“, „🖼️ Anzeigen“, „🗑 Löschen“; Batch „Alle löschen“. Hash-identische Paare werden beim Check nur **vorgemerkt** (F23/F29) und erst über „✨ Dateinamen bereinigen“ entfernt; eindeutige verwaiste Dateien bleiben zum manuellen Sichten stehen.
+- **Tab „Dateinamen“ (F24/F29):** **prominente Statistik-Karte** (Headline „Vorgemerkt für Bereinigung“ + Chips `(n)`/Doppelendung/Endung klein/Duplikate-Reste; **Button „✨ Dateinamen bereinigen (n)“** direkt daneben; Kacheln Namen mit „(n)“/Geschützt/Kollisionen/Namensabweichung/Ohne Originalname/Datei fehlt). Die vier listenfähigen Kacheln (Geschützt/Kollisionen/Namensabweichung/Ohne Originalname) sind **Klick-Toggles**: pro Status eine eigene **Lazy-Liste**, die erst beim Ausklappen gefiltert/sortiert (alphabetisch, `localeCompare` numeric) und gerendert wird (keine Deckelung; „Alle Listen ausblenden“). Beim neuen Check-Ergebnis klappen alle Listen zu.
+- **Tab „Duplikate“ (F29, 7. Tab):** **DB-Einträge mit identischem SHA-256** (≠ Tab „Verwaist“: dort Dateien ohne DB-Eintrag). Erklärungsbox beschreibt die Auflösungsregeln; pro Gruppe Tabelle mit Dateiname/Ordner/Status und **voraussichtlicher Aktion** (behalten/wird gelöscht, clientseitig berechnet); Button „🗑 Duplikate bereinigen (x Dateien in y Gruppen)“ nutzt `onExecuteDuplicates` (Online-Einträge nie löschen; Force-Backup) und ist **deaktiviert**, wenn alle Gruppen online sind (Hinweis „wird übersprungen“).
+- **F28-Force-Backup:** Vor jeder Batch-Löschung/-Bereinigung (Duplikate bereinigen, Vermisste aus DB entfernen, „Alle … löschen“ bei Defekt/OnlineMissing/Verwaist, Legacy-Bereinigung, „✨ Dateinamen bereinigen“) wird einmalig ein DB-Backup erstellt; Einzel-Löschungen und Status-Resets lösen kein Backup aus.
 
-### 8.4 Dateinamen-Prüfung (IPC `find-renamable-files`; F24 automatisch)
-- Läuft **automatisch** am Ende von `handleIntegrityCheckDone` (Struktur-Check); es gibt keinen separaten Button und kein manuelles Rename-Modal mehr.
+### 8.4 Dateinamen-Prüfung & Bereinigung (IPC `find-renamable-files`; F24/F29, Ausführung nach Bestätigung)
+- Läuft **rein lesend** am Ende von `handleIntegrityCheckDone` (Struktur-Check) und füllt `renamable.entries/stats` + `cleanupPreview`; es gibt kein manuelles Rename-Modal.
 - Kandidaten sind Dateien mit Muster `Name (n).ext`, bei denen:
   1. `originalName` vorhanden ist,
-  2. `originalName` **nicht** selbst exakt der aktuelle Name ist (echte Google-Namen mit Klammer werden geschützt),
+  2. `originalName` **nicht** selbst exakt der aktuelle Name ist (echte Google-Namen mit Klammer werden geschützt; deren Endung wird aber ggf. kleingeschrieben),
   3. der Dateistamm (ohne Endung, case-insensitiv) von `originalName` und Basisname (`Name.ext`) übereinstimmt (deckt `.JPG`/`.jpg`/HEIC→jpg ab),
   4. die `(n)`-Datei existiert,
   5. der Zielname frei ist.
 - Basisdatei existiert bereits → Hashes vergleichen (F23): **identisch** → `resolveDuplicate` (DB auf Basisnamen, `(n)` löschen); **unterschiedlich** → kein Rename, nur `collisionPair` (echte Kollision).
-- **Automatische Ausführung (F24):** `resolveDuplicate` wird via DB-Umstellung + `deleteFile` aufgelöst (Hash-Gate über `compute-file-hash`); sichere `targetMissing`-Kandidaten via `rename-file` mit `expectedHash`. Erfolge werden gezählt (`autoRenamed`/`autoResolved`) und geloggt.
+- **F29-Zusatz — Endungen normalisieren:** (a) doppelte Endungen (`Name.EXT.ext`) → `Name.ext`, Ziel ggf. durch hash-identischen Zwilling belegt (`twinName`, wird mitgelöscht); (b) großgeschriebene Endungen (`Name.EXT`) → `Name.ext` als reine case-only-Umbenennung (`caseOnlyExt`; `rename-file` führt sie zweistufig über einen Temp-Namen aus). `(n)`-Umbenennungen zielen immer auf kleingeschriebene Endungen.
+- **Ausführung (nur nach Bestätigung):** `handleIntegrityCheckDone` merkt Kandidaten + verwaiste Dateien in Refs vor; `executeCleanFilenames()` (App.tsx) erstellt ein Force-Backup und führt aus: getrackte `(n)`-Auflösung (DB → Basisname + löschen), verwaiste hash-identische Duplikate löschen (inkl. Zwillinge), dann `(n)`-/Doppelendungs-/case-only-Umbenennungen — alles mit Hash-Gate (`compute-file-hash`/`rename-file` mit `expectedHash`). Ergebnis: `CleanupSummary` (`renamed`, `doubleExt`, `extLowercased`, `removed`, `failed`), Banner „✅ Bereinigt: …“.
 - `find-renamable-files` liefert zusätzlich `entries` (F24, `RenameCheckEntry`) für **alle** Kategorien; der sechste Tab „Dateinamen“ im Fenster „Prüfung & Korrekturen“ zeigt als **Einzelzeilen** nur `protected`, `noName`, `nameMismatch` und `collision` (read-only); die übrigen Kategorien nur als Zähler (`stats`).
 
 ### 8.5 CSV-Export („📄 Excel CSV Export“)
@@ -376,7 +386,8 @@ Alle Kanalnamen exakt so (main.cjs `ipcMain`):
 | `logToConsole` | `log-to-console` | send | Log in Konsole + Datei |
 | `openLogsFolder` | `open-logs-folder` | invoke | Log-Ordner öffnen |
 | `loadDatabase` | `load-database` | invoke | JSON lesen, setzt `currentDbPath` |
-| `saveDatabase` | `save-database` | invoke | JSON schreiben + DB-Backup |
+| `saveDatabase` | `save-database` | invoke | JSON schreiben (kein Auto-Backup, F28) |
+| `createDatabaseBackup` | `create-db-backup` | invoke | DB-Backup (`daily`/`force`, F28) |
 | `saveTextFile` | `save-text-file` | invoke | CSV schreiben |
 | `checkIntegrity` | `check-db-integrity` | invoke | Struktur-Check (Objekt-Argument!) |
 | `findRenamableFiles` | `find-renamable-files` | invoke | Rename-Kandidaten |
@@ -406,8 +417,9 @@ Alle Kanalnamen exakt so (main.cjs `ipcMain`):
 - **Webview-Bereich** oben (`https://photos.google.com`, `allowpopups`). Overlays:
   - Download-Fortschrittsbalken (links oben, bis 5 gleichzeitig). **F11:** Während des Wartens auf `download-started` zeigt dieselbe Karte (stabiler Key `job:<id>`) „Warte auf Download…“, einen Sekunden-Timer und klein „max. 45 s“ (bzw. „ohne Limit“ beim Einzeldownload); beim Start wechselt sie in-place zum Fortschritt (kein Positionssprung, konstante Kartenhöhe durch reservierte Fußzeile). **F12:** feste Slots 1–5 (`slot` am Progress-Eintrag, oberster freier Slot); fertige Downloads hinterlassen unsichtbare Lücken, Karten rutschen nicht nach.
   - Status-Infos im Header „Neue Dateien“ (unten rechts): Spinner = Backup läuft (`isWalking`), „Aktive Downloads: x/5“ (bei laufendem Backup oder aktiven Einzeldownloads). Kein Overlay oben rechts mehr.
+  - **F28-Backup-Flyout:** Nach jedem erfolgreich erstellten DB-Backup erscheint oben mittig für 8 s ein grüner Hinweis „📦 DB-Backup erstellt (<Anlass>).“ (`backupNotice`, `z-[100]` → auch über Modals sichtbar; Reset räumt ihn ab).
 - **Untere Leiste (h-64):**
-  - Links: Status, Scan-Historie-Button, **„🛠️ Prüfung & Korrekturen“** (einziger Einstieg; startet beim Öffnen automatisch den Struktur-Check (F26); rot/pulsierend bei Problemen, Badge = Summe der fünf Kategorien + „+n Dup.“ bei Duplikaten), CSV-Export, Reset, Logout, Start/Stop, „⬇ 1“. Entfernt: „🔎 Datenbank prüfen“ + Duplikat-Banner (F22) und „✨ Dateinamen bereinigen“ (F24, läuft jetzt automatisch beim Struktur-Check).
+  - Links: Status, Scan-Historie-Button, **„🛠️ Prüfung & Korrekturen“** (einziger Einstieg; Check läuft **manuell** über „🔍 Struktur prüfen“ (F29), Dateiänderungen erst nach Bestätigung; rot/pulsierend bei Problemen, Badge = Summe der fünf Kategorien + „+n Dup.“ bei Duplikaten), CSV-Export, Reset, Logout, Start/Stop, „⬇ 1“. Entfernt: „🔎 Datenbank prüfen“ + Duplikat-Banner (F22) und der separate „✨ Dateinamen bereinigen“-Button (F24; jetzt im Modal).
   - Mitte: Log-Fenster (nur relevante Meldungen, max. 300 Einträge, Button „Logs“ öffnet Ordner).
   - Rechts: Liste „Neue Dateien“ (max. letzte 100, Web vs. Original-Datum, ✔/⚠).
 - **Log-Filterung** (`addLog`): Alles geht an Konsole/Logdatei, aber die UI zeigt nur `error/success/warning/album` sowie Meldungen mit Schlüsselwörtern (Backup, Datenbank, Bereinigung, Status, Web, Bereits, Bekannt, vermisst, Warte, Umbenannt, Verschoben, Metadaten, Tageswechsel, Scan-Log). Debug nur Konsole – **Ausnahme (F18):** Debug-Meldungen mit einem Muster aus `DEBUG_UI_KEYWORDS` (`Panel-Wait-Timeout`, `Bekannt:`) erscheinen zusätzlich im UI-Fenster (kursiv/grau), die Logdatei bleibt `[debug]`.
@@ -422,7 +434,7 @@ Alle Kanalnamen exakt so (main.cjs `ipcMain`):
 | Artefakt | Ort | Details |
 |---|---|---|
 | Datenbank | `<Zielordner>/gphotos_db.json` | siehe Abschnitt 6 |
-| DB-Backups | `<Zielordner>/Backups/gphotos_db_<stamp>.json` | max. 20, min. 10 min Abstand |
+| DB-Backups | `<Zielordner>/Backups/gphotos_db_<stamp>.json` | F28: Tages-Backup (1×/Kalendertag) + Force vor Bulk-Aktionen; max. 20 |
 | Logs | `<Zielordner>/Logs/backup-YYYY-MM-DD.log` | Tagesrotation; vor DB-Load: `app.getPath('userData')/Logs` |
 | CSV-Export | `<Zielordner>/gphotos_export_YYYY-MM-DD.csv` | UTF-8 BOM, Semikolon |
 | Fotos/Videos | `<Zielordner>/<YYYY>/<MM>/` | Album: `<Zielordner>/Alben/<Name>/` flach |
@@ -448,7 +460,7 @@ Diese Punkte sind bewusst dokumentiert, damit Agenten sie nicht für funktionier
 9. **Extension-Listen müssen synchron bleiben:** JPG-Erkennung `.jpg/.jpeg`; Video-Erkennung `.mp4 .mov .m4v .avi .3gp .mpg .mts`. Sie existieren mehrfach (main.cjs Download + move, App.tsx Anzeige-Typ). Bei neuen Formaten alle Stellen prüfen.
 10. **Der Crawler hängt an der Google-Photos-Web-DOM.** Änderungen an Google (aria-labels, Tastenkürzel Shift+D / i / Pfeiltasten, Panel-Layout >70 % Viewportbreite) können den Scraper brechen. `extractCurrentImageInfo` ist die zentrale Stelle.
 11. **Kein automatisches Timeout für den gesamten Download** – Start-Timeout **45 s** im Haupt-Backup (F10), Einzeldownload **ohne Limit** (F10b), 3-s-Timeout beim Scraping. Hängende Downloads können die 5-Slot-Grenze blockieren.
-12. **DB wird bei Download-Complete nur im Speicher aktualisiert**, persistiert erst durch nachfolgendes `saveDatabase()` (Download-Checkpoint alle 25 / Tageswechsel / Stop / Session-Ende). Ein harter Absturz kann bis zu 24 Downloads verlieren (dafür gibt es die Backups alle 10 min).
+12. **DB wird bei Download-Complete nur im Speicher aktualisiert**, persistiert erst durch nachfolgendes `saveDatabase()` (Download-Checkpoint alle 25 / Tageswechsel / Stop / Session-Ende). Ein harter Absturz kann bis zu 24 Downloads verlieren; abgesichert ist das über das Tages-Backup (F28) – im Notfall geht maximal der Fortschritt des aktuellen Kalendertags verloren.
 
 ### 14.1 Bekannte offene Logikfehler (Review-Liste, werden in Phase 2 einzeln abgearbeitet)
 
@@ -471,10 +483,12 @@ Diese Punkte sind bewusst dokumentiert, damit Agenten sie nicht für funktionier
 | F20 | mittel | Einzeldownloads wurden nicht sofort persistiert; nach Reload kam ein bereits geheilter `missingSince`-Stand zurück. Zusätzlich erzwang `handleSingleDownload` bei gesetztem `missingSince` einen Download ohne Existenzprüfung → `(1)`-Kopie, obwohl die Datei existierte. **Behoben in F20**: Speichern bei `wasSkipped/wasMissing/wasOnlineMissing` oder manuellem Einzeldownload; Existenzprüfung immer, stale Flag wird ohne Download zurückgesetzt. | App.tsx `onDownloadComplete`/`handleSingleDownload` |
 | F21 | mittel | Verwaiste Dateien (auf der Platte, in keinem DB-Eintrag – z. B. `(1)`-Kollisionsreste) wurden von Struktur-Check/Namensbereinigung nie erkannt, weil beide nur DB-Einträge betrachten. **Behoben in F21**: `check-db-integrity` scannt `<YYYY>/<MM>` nach untracked Dateien, vergleicht Hashes („Duplikat von …“) und zeigt sie im Integrity-Modal mit Explorer/Anzeigen/Löschen. | main.cjs `check-db-integrity`, ActionModals.tsx |
 | F22 | klein | Strukturbericht und Korrekturen waren zwei getrennte Fenster (plus separater „Datenbank prüfen“-Button und Duplikat-Banner) – redundante Einstiege, gestapelte Sektionen. **Behoben in F22**: ein Fenster „🛠️ Prüfung & Korrekturen“ mit fünf Tabs (Vermisst/Defekt/Übersprungen/Online/Verwaist), Prüf-Aktionen + Duplikate/Veraltet in Kopf-/Statuszeile; `IntegrityReportModal` entfernt. | ActionModals.tsx, App.tsx |
-| F23 | mittel | Kollisionsrest `(1)` wurde nicht aufgelöst: DB zeigte auf `Name (1).ext`, Basisdatei lag untracked vor; „Dateinamen bereinigen“ übersprang den Fall als `collisionPair` (kein Hash-Vergleich, kein Löschen). **Behoben in F23**: Untracked-Scan erkennt die Richtung (`trackedDuplicate`); Struktur-Check löst hash-identische Paare automatisch auf (DB auf Basisname, `(1)` löschen; umgekehrt untracked `(1)` löschen); Namensbereinigung erhält `resolveDuplicate`-Kandidaten mit Hash-Gate. | main.cjs `check-db-integrity`/`find-renamable-files`, App.tsx |
-| F24 | klein | Dateinamen-Prüfung war ein separater Button/Modal-Ablauf mit manuellen Umbenennungen; die Ergebnisse waren nur Summen. **Behoben in F24**: läuft automatisch beim Struktur-Check, sichere Umbenennungen + Duplikate werden automatisch angewandt; sechster Info-Tab „Dateinamen“ listet Einzelzeilen (protected/noName/nameMismatch/collision, read-only); Button und RenameModal entfernt. | main.cjs `find-renamable-files`, App.tsx, ActionModals.tsx |
-| F26 | klein | Korrektur-UI uneinheitlich (unterschiedliche Leerzustände, manueller „Struktur prüfen“-Button, zwei Inhalt-Prüf-Buttons, redundante Auto-Kacheln). **Behoben in F26**: Modal startet den Struktur-Check automatisch beim Öffnen; ein „Inhalt prüfen“-Button mit Auswahl-Dialog (vollständig/offen + Erklärung); einheitlicher Tab-Aufbau (Kopfzeile + Erklärungsbox immer sichtbar, `TabEmpty`); Dateinamen-Tab ohne Auto-Kacheln; Auto-Banner nach Duplikat-/Umbenennungs-Aktionen (8 s). | ActionModals.tsx, App.tsx |
+| F23 | mittel | Kollisionsrest `(1)` wurde nicht aufgelöst: DB zeigte auf `Name (1).ext`, Basisdatei lag untracked vor; „Dateinamen bereinigen“ übersprang den Fall als `collisionPair` (kein Hash-Vergleich, kein Löschen). **Behoben in F23**: Untracked-Scan erkennt die Richtung (`trackedDuplicate`); hash-identische Paare werden aufgelöst (DB auf Basisname, `(1)` löschen; umgekehrt untracked `(1)` löschen); Namensbereinigung erhält `resolveDuplicate`-Kandidaten mit Hash-Gate. **Seit F29** nur noch als Vorschau + Ausführung nach Bestätigung. | main.cjs `check-db-integrity`/`find-renamable-files`, App.tsx |
+| F24 | klein | Dateinamen-Prüfung war ein separater Button/Modal-Ablauf mit manuellen Umbenennungen; die Ergebnisse waren nur Summen. **Behoben in F24**: läuft beim Struktur-Check, sechster Info-Tab „Dateinamen“ listet Einzelzeilen (protected/noName/nameMismatch/collision, read-only); Button und RenameModal entfernt. **Seit F29**: Check nur noch Vorschau, Ausführung gebündelt in „✨ Dateinamen bereinigen“ nach Bestätigung. | main.cjs `find-renamable-files`, App.tsx, ActionModals.tsx |
+| F26 | klein | Korrektur-UI uneinheitlich (unterschiedliche Leerzustände, manueller „Struktur prüfen“-Button, zwei Inhalt-Prüf-Buttons, redundante Auto-Kacheln). **Behoben in F26**: ein „Inhalt prüfen“-Button mit Auswahl-Dialog (vollständig/offen + Erklärung); einheitlicher Tab-Aufbau (Kopfzeile + Erklärungsbox immer sichtbar, `TabEmpty`); Dateinamen-Tab ohne Auto-Kacheln. **F29-Anpassung:** Auto-Start des Struktur-Checks und Auto-Banner wieder entfernt – Check manuell, Änderungen nur nach Bestätigung. | ActionModals.tsx, App.tsx |
 | F27 | klein | Im Tab „Online nicht gefunden“ fehlte ein Einzel-Löschen; „Web öffnen“ wirkte verfügbar, obwohl das Foto online meist gelöscht ist. **Behoben in F27**: pro Zeile „🗑 Löschen“ (Datei + DB-Eintrag, geteilter Helfer `deleteOnlineMissingEntry`); „🌐 Web öffnen“ ausgegraut, aber weiterhin klickbar. | App.tsx, ActionModals.tsx |
+| F28 | mittel | Zeitbasiertes Auto-Backup (max. alle 10 min, max. 20) war an beliebige Save-Punkte gekoppelt; bei langen Scans fiel der Stand vor Session-Beginn aus dem Rollfenster. **Behoben in F28**: `maybeBackupDatabase` entfernt; neuer IPC `create-db-backup` mit `daily` (1× pro Kalendertag vor dem ersten Scan, Session-Start) und `force` (vor Bulk-Löschungen/Bereinigungen und Hash-Migration); max. 20 Backups, Kollisionssuffix bei gleicher Sekunde; grüner Flyout-Hinweis (8 s) nach jedem erstellten Backup. | main.cjs, preload.cjs, types.ts, App.tsx, ActionModals.tsx |
+| F29 | mittel | Endungen inkonsistent: Google liefert teils Doppelendungen (`IMG_3181.JPG.jpg`), der ZIP-/Live-Photo-Pfad übernahm die Original-Schreibweise → 3.580 Einträge mit `.JPG`/`.MOV`; zudem wurden Kandidaten des Struktur-Checks (F23/F24) ohne Nachfrage ausgeführt. **Behoben in F29**: Download-Sanitizing entfernt Doppelendungen; ZIP-Extraktion schreibt Endungen klein; `find-renamable-files` meldet Doppelendungen (`doubleExt`/`twinName`) und case-only-Endungen (`caseOnlyExt`); `rename-file` unterstützt case-only Umbenennungen (Temp-Zwischenschritt); der Struktur-Check ist **rein lesend** („🔍 Struktur prüfen“ prominent in der Kopfzeile, pulsiert; Ausführung erst nach Bestätigung im Cleanup-Dialog mit Force-Backup, Lazy-Liste und Hash-Gate). **UI-Aufräumung:** siebter Tab „Duplikate“ (DB-Einträge mit gleichem Hash, inkl. voraussichtlicher Aktion; Button aus der Statuszeile dorthin verschoben); Dateinamen-Tab mit prominenter Statistik-Karte und Lazy-Klapplisten je Status (erst beim Ausklappen gefiltert/sortiert). | main.cjs, App.tsx, ActionModals.tsx, types.ts |
 
 ---
 
@@ -507,6 +521,7 @@ Diese Punkte sind bewusst dokumentiert, damit Agenten sie nicht für funktionier
 | **corrupt** | Datei mit 0 Bytes oder Lesefehler (`integrityStatus === 'corrupt'`) |
 | **Backup-Loop** | Der parallele Crawler-Loop (max. 5 gleichzeitige Downloads) |
 | **Download-Checkpoint** | Nach je 25 erfolgreichen Haupt-Backup-Downloads wird die DB gespeichert (F15) |
+| **Tages-Backup** | Einmal pro Kalendertag vor dem ersten Scan erstellte DB-Kopie (`create-db-backup` Modus `daily`, F28) |
 | **scannedDays** | `YYYY-MM-DD` → Scan-Zeitpunkt; Grundlage der Heatmap und Orphan-Prüfung |
 | **Übersprungen / skippedDownloads** | Foto mit Download-Start-Timeout (45 s); Key = Google-ID, gelistet im Korrektur-Modal (F10) |
 | **Hash-Gate** | Pflicht-Hash-Vergleich vor Datei-Mutation |

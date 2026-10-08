@@ -121,6 +121,28 @@ export interface UntrackedFile {
     trackedDuplicate?: { id: string; filename: string };
 }
 
+// F29: Geplante Dateinamen-Änderung (Vorschau; wird erst nach Bestätigung ausgeführt)
+export interface CleanupPlanItem {
+    kind: 'rename' | 'resolve' | 'delete';
+    from: string;                                    // aktueller Name bzw. zu löschende Datei
+    to?: string;                                     // Zielname (rename) bzw. Basisname (resolve)
+    reason: 'suffix' | 'doubleExt' | 'extLowercase' | 'duplicate' | 'trackedDuplicate';
+}
+
+export interface CleanupPreview {
+    items: CleanupPlanItem[];
+    skipped: { name: string; reason: string }[];
+}
+
+// F29: Ergebnis der ausgeführten Bereinigung (für den Bestätigungs-/Erfolgsbanner)
+export interface CleanupSummary {
+    renamed: number;
+    doubleExt: number;
+    extLowercased: number;
+    removed: number;
+    failed: number;
+}
+
 export interface IntegrityResult {
     missing: IntegrityError[];
     duplicates: { hash: string; ids: string[] }[];
@@ -130,12 +152,11 @@ export interface IntegrityResult {
     sizeUpdates?: Record<string, number>; // NEU: ID -> Dateigröße in Bytes
     legacyCount?: number; // NEU: Anzahl veralteter Einträge
     untracked?: UntrackedFile[]; // F21: verwaiste Dateien auf der Platte
-    renamable?: { // F24: Ergebnis der Dateinamen-Prüfung (Info-Tab)
+    renamable?: { // F24: Ergebnis der Dateinamen-Prüfung (Info-Tab, Vorschau)
         entries: RenameCheckEntry[];
         stats?: RenamableStats;
-        autoRenamed?: number;
-        autoResolved?: number;
     };
+    cleanupPreview?: CleanupPreview; // F29: geplante Bereinigung (nur nach Bestätigung)
 }
 
 export interface RenamableFile {
@@ -145,6 +166,9 @@ export interface RenamableFile {
     timestamp: number;
     path: string; // Relativer Pfad
     resolveDuplicate?: boolean; // F23: Basisdatei hash-identisch -> Duplikat auflösen statt umbenennen
+    doubleExt?: boolean;        // F29: doppelte Endung (Name.EXT.ext) normalisieren
+    twinName?: string;          // F29: hash-identischer Zwilling (wird vor dem Umbenennen gelöscht)
+    caseOnlyExt?: boolean;      // F29: nur Endung kleinschreiben (case-only)
 }
 
 export interface RenamableStats {
@@ -156,6 +180,8 @@ export interface RenamableStats {
     collisionPair: number;   // Basisdatei existiert ebenfalls, Inhalt unterschiedlich
     targetMissing: number;   // Basisname ist frei -> Kandidat
     resolveDuplicate: number; // F23: Basisdatei hash-identisch -> auflösbar
+    doubleExt?: number;      // F29: Doppelendungen -> normalisierbar
+    extLowercase?: number;   // F29: Großgeschriebene Endungen -> kleinschreiben
 }
 
 // F24: Einzel-Eintrag der Dateinamen-Prüfung (für den Info-Tab).
@@ -166,7 +192,8 @@ export interface RenameCheckEntry {
     originalName?: string;
     timestamp: number;
     status: 'protected' | 'noName' | 'nameMismatch' | 'missing'
-          | 'collision' | 'resolveDuplicate' | 'renamable';
+          | 'collision' | 'resolveDuplicate' | 'renamable'
+          | 'doubleExt' | 'extLowercase';
 }
 
 // Global Window Interface für Electron
@@ -182,6 +209,7 @@ declare global {
       // Database Ops
       loadDatabase: (filePath: string) => Promise<FileDatabase | null>; // Nimmt jetzt FilePath
       saveDatabase: (filePath: string, data: FileDatabase) => Promise<boolean>;
+      createDatabaseBackup: (filePath: string, mode: 'daily' | 'force', reason?: string) => Promise<{ success: boolean, created: boolean, path?: string }>; // F28
       saveTextFile: (filePath: string, content: string) => Promise<{success: boolean, path?: string, error?: string}>; // NEU: CSV Export
       checkIntegrity: (basePath: string, files: Record<string, DatabaseEntry>, onlySubset?: boolean) => Promise<IntegrityResult>;
       findRenamableFiles: (basePath: string, files: Record<string, DatabaseEntry>) => Promise<{ candidates: RenamableFile[], stats: RenamableStats, entries?: RenameCheckEntry[] }>;

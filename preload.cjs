@@ -20,6 +20,7 @@ contextBridge.exposeInMainWorld('electron', {
   // Database Functions
   loadDatabase: (filePath) => ipcRenderer.invoke('load-database', filePath),
   saveDatabase: (filePath, data) => ipcRenderer.invoke('save-database', filePath, data),
+  createDatabaseBackup: (filePath, mode, reason) => ipcRenderer.invoke('create-db-backup', filePath, mode, reason), // F28
   saveTextFile: (filePath, content) => ipcRenderer.invoke('save-text-file', filePath, content), // NEU
   checkIntegrity: (basePath, files, onlySubset) => ipcRenderer.invoke('check-db-integrity', { basePath, files, onlySubset }),
   findRenamableFiles: (basePath, files) => ipcRenderer.invoke('find-renamable-files', { basePath, files }),

@@ -36,10 +36,8 @@ const isDev = !app.isPackaged;
 let mainWindow;
 
 // --- LOGGING & DB-BACKUPS ---
-const DB_BACKUP_INTERVAL_MS = 10 * 60 * 1000;
 const DB_BACKUP_MAX = 20;
 let currentDbPath = null;
-let lastDbBackupAt = 0;
 
 function getLogDir() {
     const baseDir = currentDbPath ? path.dirname(currentDbPath) : app.getPath('userData');
@@ -58,34 +56,49 @@ function appendLog(type, message) {
     } catch (e) { /* Logging darf den Ablauf nie unterbrechen */ }
 }
 
-function maybeBackupDatabase(filePath) {
-    try {
-        if (!filePath || !fs.existsSync(filePath)) return;
-        const now = Date.now();
-        if (now - lastDbBackupAt < DB_BACKUP_INTERVAL_MS) return;
-        lastDbBackupAt = now;
+// F28: Backup-Strategie – kein zeitbasiertes Auto-Backup mehr.
+// 'daily': einmal pro Kalendertag vor dem ersten Scan; 'force': vor irreversiblen Bulk-Aktionen.
+function rotateDatabaseBackups(backupDir) {
+    const entries = fs.readdirSync(backupDir)
+        .filter(f => f.startsWith('gphotos_db_') && f.endsWith('.json'))
+        .map(f => ({ f, t: fs.statSync(path.join(backupDir, f)).mtimeMs }))
+        .sort((a, b) => a.t - b.t);
+    while (entries.length > DB_BACKUP_MAX) {
+        const oldest = entries.shift();
+        try { fs.unlinkSync(path.join(backupDir, oldest.f)); } catch (e) {}
+    }
+}
 
+function createDatabaseBackup(filePath, reason) {
+    try {
+        if (!filePath || !fs.existsSync(filePath)) return { success: false, created: false };
         const backupDir = path.join(path.dirname(filePath), 'Backups');
         fs.mkdirSync(backupDir, { recursive: true });
 
-        const d = new Date(now);
+        const d = new Date();
         const pad = n => (n < 10 ? '0' + n : n);
         const stamp = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
-        const target = path.join(backupDir, `gphotos_db_${stamp}.json`);
-        fs.copyFileSync(filePath, target);
-
-        const entries = fs.readdirSync(backupDir)
-            .filter(f => f.startsWith('gphotos_db_') && f.endsWith('.json'))
-            .map(f => ({ f, t: fs.statSync(path.join(backupDir, f)).mtimeMs }))
-            .sort((a, b) => a.t - b.t);
-        while (entries.length > DB_BACKUP_MAX) {
-            const oldest = entries.shift();
-            try { fs.unlinkSync(path.join(backupDir, oldest.f)); } catch (e) {}
+        let target = path.join(backupDir, `gphotos_db_${stamp}.json`);
+        let counter = 1;
+        while (fs.existsSync(target)) {
+            target = path.join(backupDir, `gphotos_db_${stamp}_${counter}.json`);
+            counter++;
         }
-        appendLog('info', `DB-Backup erstellt: ${target}`);
+        fs.copyFileSync(filePath, target);
+        rotateDatabaseBackups(backupDir);
+        appendLog('info', `DB-Backup (${reason || 'manuell'}) erstellt: ${target}`);
+        return { success: true, created: true, path: target };
     } catch (e) {
         appendLog('error', `DB-Backup fehlgeschlagen: ${e.message}`);
+        return { success: false, created: false };
     }
+}
+
+function hasBackupForDate(backupDir, dateStr) {
+    try {
+        if (!fs.existsSync(backupDir)) return false;
+        return fs.readdirSync(backupDir).some(f => f.startsWith(`gphotos_db_${dateStr}_`) && f.endsWith('.json'));
+    } catch (e) { return false; }
 }
 
 // Globaler State für den NÄCHSTEN Download-Vorgang (Initialisierung)
@@ -183,6 +196,11 @@ function createWindow() {
     
     let ext = rawExt.toLowerCase();
 
+    // F29: Doppelte Endung entfernen (Google liefert z. B. IMG_3181.JPG.jpg)
+    while (ext && baseName.length > ext.length && baseName.toLowerCase().endsWith(ext)) {
+        baseName = baseName.substring(0, baseName.length - ext.length);
+    }
+
     // Kürzen, falls zu lang
     if (baseName.length > MAX_FILENAME_LEN) {
         baseName = baseName.substring(0, MAX_FILENAME_LEN).trim();
@@ -268,9 +286,10 @@ function createWindow() {
                             imageNameNoExt = imageNameNoExt.substring(0, imageNameNoExt.length - imageExt.length);
                         }
                         
-                        let newFilename = originalImageName;
-                        let zipCounter = 1;
+                        // F29: Endung des entpackten Bildes immer kleinschreiben (einheitliche Dateinamen)
                         const lowerImageExt = imageExt.toLowerCase();
+                        let newFilename = `${imageNameNoExt}${lowerImageExt}`;
+                        let zipCounter = 1;
 
                         // Kollisionsprüfung für das entpackte Bild
                         while (isTargetPathTaken(targetSubFolder, newFilename)) {
@@ -439,8 +458,21 @@ ipcMain.handle('load-database', async (event, filePath) => {
 
 ipcMain.handle('save-database', async (event, filePath, data) => {
     currentDbPath = filePath;
-    maybeBackupDatabase(filePath);
     try { fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf-8'); return true; } catch (e) { return false; }
+});
+
+// F28: Forciertes bzw. tagesgebundenes DB-Backup (ersetzt das zeitbasierte Auto-Backup).
+ipcMain.handle('create-db-backup', async (event, filePath, mode, reason) => {
+    if (!filePath || !fs.existsSync(filePath)) return { success: false, created: false };
+    if (mode === 'daily') {
+        const d = new Date();
+        const pad = n => (n < 10 ? '0' + n : n);
+        const dateStr = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+        if (hasBackupForDate(path.join(path.dirname(filePath), 'Backups'), dateStr)) {
+            return { success: true, created: false };
+        }
+    }
+    return createDatabaseBackup(filePath, reason || mode);
 });
 
 ipcMain.handle('save-text-file', async (event, filePath, content) => {
@@ -749,7 +781,9 @@ ipcMain.handle('find-renamable-files', async (event, { basePath, files }) => {
         currentMissing: 0,   // "(n)"-Datei liegt nicht auf der Platte
         collisionPair: 0,    // Basisdatei existiert ebenfalls, Inhalt unterschiedlich
         targetMissing: 0,    // Basisname ist frei -> Kandidat
-        resolveDuplicate: 0  // F23: Basisdatei hash-identisch -> Duplikat auflösbar
+        resolveDuplicate: 0, // F23: Basisdatei hash-identisch -> Duplikat auflösbar
+        doubleExt: 0,        // F29: Doppelte Endung (Name.EXT.ext) -> normalisierbar
+        extLowercase: 0      // F29: Großgeschriebene Endung -> kleinschreiben
     };
 
     const fileStem = (name) => {
@@ -758,23 +792,41 @@ ipcMain.handle('find-renamable-files', async (event, { basePath, files }) => {
         return ext ? base.slice(0, -ext.length) : base;
     };
 
+    // F29: Kandidat für reine Endungs-Kleinschreibung (case-only, Inhalt unverändert)
+    const pushCaseOnlyExtCandidate = (id, entry) => {
+        const fn = entry.filename;
+        const ext = path.extname(fn);
+        if (!ext || ext === ext.toLowerCase()) return false;
+        const newName = fn.slice(0, fn.length - ext.length) + ext.toLowerCase();
+        const dateObj = new Date(entry.timestamp);
+        const year = dateObj.getFullYear().toString();
+        const month = (dateObj.getMonth() + 1).toString().padStart(2, '0');
+        if (!fs.existsSync(path.join(basePath, year, month, fn))) return false;
+        stats.extLowercase++;
+        checkEntries.push({ id, currentName: fn, newName, originalName: entry.originalName, timestamp: entry.timestamp, status: 'extLowercase' });
+        candidates.push({ id, currentName: fn, newName, timestamp: entry.timestamp, path: path.join(year, month), caseOnlyExt: true });
+        return true;
+    };
+
     for (const [id, entry] of entries) {
         const match = entry.filename.match(suffixRegex);
         if (!match) continue;
 
         stats.nTotal++;
-        const cleanName = match[1] + match[2]; // "Name.jpg"
+        const cleanName = match[1] + match[2].toLowerCase(); // F29: Endung immer klein
 
-        // Echter Google-Name mit "(n)" -> niemals umbenennen
+        // Echter Google-Name mit "(n)" -> niemals umbenennen (aber Endung darf kleingeschrieben werden)
         if (entry.originalName && entry.originalName.toLowerCase() === entry.filename.toLowerCase()) {
             stats.legitNames++;
             checkEntries.push({ id, currentName: entry.filename, originalName: entry.originalName, timestamp: entry.timestamp, status: 'protected' });
+            pushCaseOnlyExtCandidate(id, entry);
             continue;
         }
 
         if (!entry.originalName) {
             stats.noName++;
             checkEntries.push({ id, currentName: entry.filename, timestamp: entry.timestamp, status: 'noName' });
+            pushCaseOnlyExtCandidate(id, entry);
             continue;
         }
 
@@ -782,6 +834,7 @@ ipcMain.handle('find-renamable-files', async (event, { basePath, files }) => {
         if (fileStem(entry.originalName).toLowerCase() !== fileStem(cleanName).toLowerCase()) {
             stats.nameMismatch++;
             checkEntries.push({ id, currentName: entry.filename, originalName: entry.originalName, timestamp: entry.timestamp, status: 'nameMismatch' });
+            pushCaseOnlyExtCandidate(id, entry);
             continue;
         }
 
@@ -812,6 +865,7 @@ ipcMain.handle('find-renamable-files', async (event, { basePath, files }) => {
             if (!identical) {
                 stats.collisionPair++;
                 checkEntries.push({ id, currentName: entry.filename, newName: cleanName, originalName: entry.originalName, timestamp: entry.timestamp, status: 'collision' });
+                pushCaseOnlyExtCandidate(id, entry);
                 continue;
             }
 
@@ -839,6 +893,83 @@ ipcMain.handle('find-renamable-files', async (event, { basePath, files }) => {
         });
     }
 
+    // F29: Doppelendungen + großgeschriebene Endungen für Dateien OHNE "(n)" normalisieren (nur Vorschau)
+    for (const [id, entry] of entries) {
+        const fn = entry.filename;
+        if (suffixRegex.test(fn)) continue; // "(n)"-Fälle oben behandelt
+
+        const ext = path.extname(fn);
+        if (!ext) continue;
+        const stem = fn.slice(0, fn.length - ext.length);
+        const lowerExt = ext.toLowerCase();
+        const isDoubleExt = stem.toLowerCase().endsWith(lowerExt);
+        const hasUpperExt = ext !== lowerExt;
+        if (!isDoubleExt && !hasUpperExt) continue;
+
+        const newStem = isDoubleExt ? stem.slice(0, stem.length - lowerExt.length) : stem;
+        const newName = newStem + lowerExt;
+
+        // Doppelendung: Sicherheitscheck über originalName (verhindert das Kürzen legitimer Namen).
+        // Reine Groß/Klein-Endung ist case-only und daher immer sicher (nur Diagnose-Zähler).
+        if (isDoubleExt) {
+            if (!entry.originalName) {
+                stats.noName++;
+                checkEntries.push({ id, currentName: fn, timestamp: entry.timestamp, status: 'noName' });
+                continue;
+            }
+            if (fileStem(entry.originalName).toLowerCase() !== fileStem(newName).toLowerCase()) {
+                stats.nameMismatch++;
+                checkEntries.push({ id, currentName: fn, newName, originalName: entry.originalName, timestamp: entry.timestamp, status: 'nameMismatch' });
+                continue;
+            }
+        } else if (entry.originalName && fileStem(entry.originalName).toLowerCase() !== fileStem(newName).toLowerCase()) {
+            // Altbestand (Stale-Panel-Ära): originalName weicht ab, Umbenennung der Endung bleibt sicher
+            stats.nameMismatch++;
+            checkEntries.push({ id, currentName: fn, newName, originalName: entry.originalName, timestamp: entry.timestamp, status: 'nameMismatch' });
+        }
+
+        const dateObj = new Date(entry.timestamp);
+        const year = dateObj.getFullYear().toString();
+        const month = (dateObj.getMonth() + 1).toString().padStart(2, '0');
+        const dir = path.join(basePath, year, month);
+        const currentPath = path.join(dir, fn);
+        if (!fs.existsSync(currentPath)) {
+            stats.currentMissing++;
+            checkEntries.push({ id, currentName: fn, newName, originalName: entry.originalName, timestamp: entry.timestamp, status: 'missing' });
+            continue;
+        }
+
+        if (isDoubleExt) {
+            const targetPath = path.join(dir, newName);
+            if (fs.existsSync(targetPath)) {
+                let identical = false;
+                try {
+                    const h1 = await getFileHash(currentPath);
+                    const h2 = await getFileHash(targetPath);
+                    identical = h1 === h2;
+                } catch (e) { /* Hash-Fehler -> als echte Kollision behandeln */ }
+                if (!identical) {
+                    stats.collisionPair++;
+                    checkEntries.push({ id, currentName: fn, newName, originalName: entry.originalName, timestamp: entry.timestamp, status: 'collision' });
+                    continue;
+                }
+                stats.doubleExt++;
+                checkEntries.push({ id, currentName: fn, newName, originalName: entry.originalName, timestamp: entry.timestamp, status: 'doubleExt' });
+                candidates.push({ id, currentName: fn, newName, timestamp: entry.timestamp, path: path.join(year, month), doubleExt: true, twinName: newName });
+                continue;
+            }
+            stats.doubleExt++;
+            checkEntries.push({ id, currentName: fn, newName, originalName: entry.originalName, timestamp: entry.timestamp, status: 'doubleExt' });
+            candidates.push({ id, currentName: fn, newName, timestamp: entry.timestamp, path: path.join(year, month), doubleExt: true });
+            continue;
+        }
+
+        // Reine Groß/Klein-Endung (case-only)
+        stats.extLowercase++;
+        checkEntries.push({ id, currentName: fn, newName, originalName: entry.originalName, timestamp: entry.timestamp, status: 'extLowercase' });
+        candidates.push({ id, currentName: fn, newName, timestamp: entry.timestamp, path: path.join(year, month), caseOnlyExt: true });
+    }
+
     return { candidates, stats, entries: checkEntries };
 });
 
@@ -850,10 +981,12 @@ ipcMain.handle('rename-file', async (event, { basePath, oldName, newName, timest
     
     const oldPath = path.join(dir, oldName);
     const newPath = path.join(dir, newName);
+    // F29: Reine Groß/Klein-Umbenennung (Windows: gleiche Datei, case-insensitiv) erlauben
+    const isCaseOnlyRename = oldPath !== newPath && oldPath.toLowerCase() === newPath.toLowerCase();
 
     try {
         if (!fs.existsSync(oldPath)) return { success: false, error: 'Quelldatei fehlt' };
-        if (fs.existsSync(newPath)) return { success: false, error: 'Zielname bereits belegt' };
+        if (!isCaseOnlyRename && fs.existsSync(newPath)) return { success: false, error: 'Zielname bereits belegt' };
 
         if (expectedHash) {
             const actualHash = await getFileHash(oldPath);
@@ -863,7 +996,14 @@ ipcMain.handle('rename-file', async (event, { basePath, oldName, newName, timest
             }
         }
 
-        fs.renameSync(oldPath, newPath);
+        if (isCaseOnlyRename) {
+            // Zweistufig über neutralen Temp-Namen (case-only Rename auf NTFS)
+            const tmpPath = path.join(dir, `${oldName}.rle_tmp_${Date.now()}`);
+            fs.renameSync(oldPath, tmpPath);
+            fs.renameSync(tmpPath, newPath);
+        } else {
+            fs.renameSync(oldPath, newPath);
+        }
         appendLog('info', `Umbenannt: ${oldPath} -> ${newPath}${expectedHash ? ' [Hash ok]' : ''}`);
         return { success: true };
     } catch (e) {
