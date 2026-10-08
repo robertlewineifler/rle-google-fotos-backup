@@ -29,6 +29,7 @@ contextBridge.exposeInMainWorld('electron', {
   // Neue Funktionen für Shift+D Flow
   prepareDownload: (config) => ipcRenderer.invoke('prepare-download', config),
   cancelPendingDownload: () => ipcRenderer.invoke('cancel-pending-download'), // F10
+  setPowerSaveBlocker: (enable) => ipcRenderer.invoke('set-power-save-blocker', enable), // F33
   onDownloadStarted: (callback) => {
       // F11: finaler Dateiname wird mitgeliefert (Wartekarte -> Fortschrittskarte ohne Positionssprung)
       const listener = (event, id, filename) => callback(id, filename);

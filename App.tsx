@@ -84,12 +84,16 @@ const App: React.FC = () => {
   const webviewRef = useRef<any>(null);
   const tableContainerRef = useRef<HTMLDivElement>(null);
   const logContainerRef = useRef<HTMLDivElement>(null);
+  // Auto-Scroll: Pausiert nur, solange die Maus über der jeweiligen Liste ist
+  const logHoverRef = useRef(false);
+  const filesHoverRef = useRef(false);
   const isWalkingRef = useRef(false);
   const isAlbumModeRef = useRef(false);
   const albumTargetPathRef = useRef<string | null>(null);
   // --- Stale-Panel-Schutz (0-ms-Detektor) ---
-  const prevTrueMetaRef = useRef<{ id: string; filename?: string; originalDate?: string; webTimestamp?: number } | null>(null);
-  const newDownloadMetaRef = useRef<Map<string, { filename: string; originalDate?: string }>>(new Map());
+  // F31: originalName mitführen, damit legitime "(n)"-Google-Namen (z. B. "DB 2025 (970).JPG") exakt verglichen werden können.
+  const prevTrueMetaRef = useRef<{ id: string; filename?: string; originalName?: string; originalDate?: string; webTimestamp?: number } | null>(null);
+  const newDownloadMetaRef = useRef<Map<string, { filename: string; originalName?: string; originalDate?: string }>>(new Map());
   // --- Panel-Refresh-Wait (F1) ---
   const lastPanelSignatureRef = useRef<string | null>(null);
   const panelRefreshedRef = useRef(false); // Panel nach Navigation bestätigt aktualisiert
@@ -157,6 +161,29 @@ const App: React.FC = () => {
   
   const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
 
+  // Auto-Scroll für Log- und „Neue Dateien"-Liste: springt bei neuen Einträgen nach unten,
+  // pausiert nur, solange die Maus über der jeweiligen Liste ist (manuelles Scrollen bleibt möglich).
+  const scrollLogsToBottom = () => {
+      const el = logContainerRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
+  };
+  const scrollFilesToBottom = () => {
+      const el = tableContainerRef.current;
+      if (el) el.scrollTop = el.scrollHeight;
+  };
+  useEffect(() => {
+      if (!logHoverRef.current) scrollLogsToBottom();
+  }, [logs]);
+  useEffect(() => {
+      if (!filesHoverRef.current) scrollFilesToBottom();
+  }, [downloadedFiles]);
+
+  // F33: Während Scan und laufender Downloads Ruhemodus + Bildschirm-Aus verhindern.
+  // Nach „Stop“ bleibt der Schutz aktiv, bis alle Downloads fertig sind; Reset/App-Ende gibt ihn frei.
+  useEffect(() => {
+      void window.electron?.setPowerSaveBlocker(isWalking || activeDownloadsCount > 0);
+  }, [isWalking, activeDownloadsCount]);
+
   // --- HELPER: Safe Crawler Calls with Timeout ---
   // Das verhindert, dass das Programm hängt, wenn das Webview nicht antwortet
   const safeExtractInfo = async () => {
@@ -193,7 +220,14 @@ const App: React.FC = () => {
       const prev = prevTrueMetaRef.current;
       const probeName = info?.potentialFilename;
       if (!prev?.filename || !probeName) return false;
-      return stripCollisionSuffix(probeName).toLowerCase() === stripCollisionSuffix(prev.filename).toLowerCase();
+      const probe = probeName.toLowerCase();
+      // F31: exakter Vergleich – legitime "(n)"-Google-Namen (z. B. "DB 2025 (970).JPG") dürfen
+      // nicht mit dem Nachbarn "DB 2025 (969).JPG" kollidieren.
+      if (probe === prev.filename.toLowerCase()) return true;
+      if (prev.originalName && probe === prev.originalName.toLowerCase()) return true;
+      // Kollisions-Suffix nur entfernen, wenn der echte Google-Name des Vorgängers unbekannt ist.
+      if (!prev.originalName && stripCollisionSuffix(prev.filename).toLowerCase() === probe) return true;
+      return false;
   };
   const waitForPanelRefresh = async (prevSignature: string | null, timeoutMs: number = PANEL_REFRESH_TIMEOUT_MS): Promise<boolean> => {
       const start = Date.now();
@@ -245,7 +279,9 @@ const App: React.FC = () => {
       // Gilt auch bei bestätigtem Panel-Refresh (schützt vor Teil-Updates).
       if (prev?.filename && candidate) {
           const ownNames = [entry?.filename, entry?.originalName].filter(Boolean).map(n => n!.toLowerCase());
-          if (sameName(candidate, prev.filename) && !ownNames.includes(candidate.toLowerCase())) {
+          // F31: Auch der gespeicherte Google-Name des Vorgängers zählt als Namenssperre.
+          const matchesPrevName = sameName(candidate, prev.filename) || sameName(candidate, prev.originalName);
+          if (matchesPrevName && !ownNames.includes(candidate.toLowerCase())) {
               return { trusted: false, reason: 'Kandidat entspricht Vorgängername' };
           }
       }
@@ -289,13 +325,14 @@ const App: React.FC = () => {
   // Merkt sich die verlässlichsten Metadaten des zuletzt besuchten Fotos (für den Detektor).
   const rememberTrueMeta = (id: string, entry: DatabaseEntry | undefined, result: any, webTimestamp: number, trusted: boolean) => {
       if (entry) {
-          prevTrueMetaRef.current = { id, filename: entry.filename, originalDate: entry.originalDate, webTimestamp: trusted ? webTimestamp : undefined };
+          prevTrueMetaRef.current = { id, filename: entry.filename, originalName: entry.originalName, originalDate: entry.originalDate, webTimestamp: trusted ? webTimestamp : undefined };
           return;
       }
       const dl = newDownloadMetaRef.current.get(id);
       if (dl) {
-          prevTrueMetaRef.current = { id, filename: dl.filename, originalDate: dl.originalDate, webTimestamp: trusted ? webTimestamp : undefined };
+          prevTrueMetaRef.current = { id, filename: dl.filename, originalName: dl.originalName, originalDate: dl.originalDate, webTimestamp: trusted ? webTimestamp : undefined };
       } else {
+          // "filename" enthält hier bereits den gescrapten Google-Namen (potenzieller Originalname).
           prevTrueMetaRef.current = { id, filename: trusted ? (result?.potentialFilename || undefined) : undefined, originalDate: undefined, webTimestamp: trusted ? webTimestamp : undefined };
       }
   };
@@ -347,7 +384,7 @@ const App: React.FC = () => {
                   const prevEntry = dbRef.current.files[result.id];
                   const wasMissing = !!prevEntry?.missingSince;
                   const wasOnlineMissing = !!prevEntry?.onlineMissingSince;
-                  newDownloadMetaRef.current.set(result.id, { filename: result.filename, originalDate: result.originalExifDate || undefined });
+                  newDownloadMetaRef.current.set(result.id, { filename: result.filename, originalName: result.originalName || undefined, originalDate: result.originalExifDate || undefined });
                   const ext = result.filename.split('.').pop()?.toLowerCase();
                   const isVideo = ['mp4', 'mov', 'm4v', 'avi', '3gp', 'mpg'].includes(ext || '');
                   const originalExifDate = parseExifDateToDate(result.originalExifDate || "");
@@ -1230,6 +1267,8 @@ const App: React.FC = () => {
       desyncAbortRef.current = false;
       cleanupCandidatesRef.current = []; // F29: Vorschau eines anderen DB-Stands nie ausführen
       cleanupUntrackedRef.current = [];
+      logHoverRef.current = false; // Auto-Scroll-Pause zurücksetzen
+      filesHoverRef.current = false;
       
       // 4. Force Cleanup of Webview State if possible
       setIsInitialized(false);
@@ -1448,25 +1487,15 @@ const App: React.FC = () => {
       }
   };
 
-  const checkForOrphans = async () => {
-      if (!exportPath) return;
-      if (minDateEncountered.current === null || maxDateEncountered.current === null) return;
-      const minTs = minDateEncountered.current;
-      const maxTs = maxDateEncountered.current;
-      const safeStart = new Date(minTs); safeStart.setHours(0,0,0,0); safeStart.setDate(safeStart.getDate() + 1);
-      const safeEnd = new Date(maxTs); safeEnd.setHours(0,0,0,0);
-      
-      if (safeStart.getTime() >= safeEnd.getTime()) {
-          addLog("Keine vollständigen Tage gescannt. Überspringe Missing-Prüfung.", 'info');
-          return;
-      }
-      
-      addLog(`Prüfe Missing zwischen ${safeStart.toLocaleDateString()} und ${safeEnd.toLocaleDateString()}...`, 'info');
+  // F32: Missing-Prüfung pro fertig gescanntem Tag (ersetzt die frühere Sammel-Prüfung am Session-Ende,
+  // die bei Desync-Abbruch komplett übersprungen wurde). Läuft direkt beim Tageswechsel.
+  const checkMissingForDay = async (dayIso: string) => {
+      if (!exportPath || !window.electron) return;
       let markedLocal = 0;
       let markedOnline = 0;
       const entries = Object.entries(dbRef.current.files) as [string, DatabaseEntry][];
       for (const [id, entry] of entries) {
-          if (entry.timestamp < safeStart.getTime() || entry.timestamp >= safeEnd.getTime()) continue;
+          if (getIsoDateString(new Date(entry.timestamp)) !== dayIso) continue;
           if (sessionSeenIds.current.has(id)) continue;
           if (entry.missingSince || entry.onlineMissingSince) continue;
 
@@ -1489,9 +1518,9 @@ const App: React.FC = () => {
       if (markedLocal > 0) updateOrphansList();
       if (markedOnline > 0) updateOnlineMissingList(); // F13
       if (markedLocal > 0 || markedOnline > 0) {
-          addLog(`${markedLocal} Dateien lokal vermisst, ${markedOnline} online nicht gefunden.`, markedLocal > 0 ? 'error' : 'warning');
+          addLog(`📅 Missing-Check ${dayIso}: ${markedLocal} vermisst, ${markedOnline} online fehlt.`, markedLocal > 0 ? 'error' : 'warning');
       } else {
-          addLog("Alles synchron.", 'success');
+          addLog(`📅 Missing-Check ${dayIso}: alles synchron.`, 'success');
       }
   };
 
@@ -1502,17 +1531,11 @@ const App: React.FC = () => {
       addLog("Sicherheits-Speicherung durchgeführt.", 'success');
   };
   
-  const finishBackupSession = async (skipOrphans: boolean = false) => {
+  const finishBackupSession = async () => {
       if (isResettingRef.current) return;
 
-      if (skipOrphans) {
-          addLog("Missing-Prüfung übersprungen (Session unvollständig/Desync).", 'warning');
-      } else {
-          await checkForOrphans();
-      }
-      
-      // Hinweis: Die "scannedRanges" Logik wurde hier entfernt, da wir jetzt pro Tag (scannedDays) speichern.
-      // Die Aktualisierung der scannedDays passiert live in der Schleife bei Tageswechsel.
+      // Hinweis: Die Missing-Prüfung läuft seit F32 pro fertig gescanntem Tag (checkMissingForDay beim Tageswechsel).
+      // Die "scannedRanges" Logik wurde entfernt, da wir jetzt pro Tag (scannedDays) speichern.
 
       if (dbFilePath && (processedIdsRef.current.size > 0 || minDateEncountered.current)) {
           await saveDatabase();
@@ -1819,6 +1842,7 @@ const App: React.FC = () => {
                     dbRef.current.scannedDays[lastDayIdentifier] = Date.now();
                     
                     addLog(`📅 Scan-Log: ${lastDayIdentifier} erledigt.`, 'success');
+                    await checkMissingForDay(lastDayIdentifier); // F32: fehlende/online-verschwundene Dateien dieses Tags prüfen
                     await saveDatabase();
                 } else {
                     addLog(`📅 Scan-Log: ${lastDayIdentifier} übersprungen (Start-Tag unsicher).`, 'info');
@@ -1875,9 +1899,9 @@ const App: React.FC = () => {
 
                             if (result.potentialFilename && (!existingEntry.originalName || existingEntry.originalName !== result.potentialFilename)) {
                                  const candidateName = result.potentialFilename;
-                                 if (candidateName.toLowerCase() === existingEntry.filename.toLowerCase()) {
-                                     // Kandidat entspricht bereits dem Dateinamen -> nichts zu tun
-                                 } else if (!trustInfo.trusted) {
+                                 // F30: NICHT überspringen, wenn der Panel-Name (case-insensitiv) dem Dateinamen entspricht –
+                                 // der gespeicherte originalName kann aus der Stale-Panel-Ära veraltet/falsch sein.
+                                 if (!trustInfo.trusted) {
                                      addLog(`⚠️ Namens-Korrektur übersprungen (${trustInfo.reason}): "${candidateName}" für ${existingEntry.filename}`, 'warning');
                                  } else {
                                      const oldNameLog = existingEntry.originalName || "(keiner)";
@@ -1998,7 +2022,7 @@ const App: React.FC = () => {
         addLog('[ALBUM] Album-Download beendet.', 'album');
         cancelPendingStarts(); // F10: defensiv
     } else {
-        await finishBackupSession(desyncAbortRef.current);
+        await finishBackupSession();
     }
   };
 
@@ -2169,7 +2193,12 @@ const App: React.FC = () => {
                  <h3 className="font-bold text-slate-400 uppercase text-xs tracking-wider">Wichtige Ereignisse</h3>
                  <button onClick={() => window.electron.openLogsFolder()} className="text-[10px] text-slate-400 hover:text-white px-1" title="Log-Ordner öffnen">📜 Logs</button>
              </div>
-             <div className="flex-1 bg-black/50 rounded border border-slate-700 p-2 overflow-y-auto font-mono text-[10px] scrollbar-thin" ref={logContainerRef}>
+             <div
+                 className="flex-1 bg-black/50 rounded border border-slate-700 p-2 overflow-y-auto font-mono text-[10px] scrollbar-thin"
+                 ref={logContainerRef}
+                 onMouseEnter={() => { logHoverRef.current = true; }}
+                 onMouseLeave={() => { logHoverRef.current = false; scrollLogsToBottom(); }}
+             >
                  {logs.map((l, i) => (
                     <div key={i} className={`mb-1 px-1 rounded ${
                         l.type === 'error' ? 'bg-red-900/30 text-red-300' : 
@@ -2200,7 +2229,12 @@ const App: React.FC = () => {
              </div>
              <div className="flex-1 bg-slate-900 rounded border border-slate-700 overflow-hidden flex flex-col">
                 <div className="flex bg-slate-800 text-[10px] text-slate-400 p-2 font-bold border-b border-slate-700"><div className="w-6 text-center"></div><div className="flex-1 px-1">Name</div><div className="w-24">Web</div><div className="w-24">Original</div><div className="w-12 text-center">Status</div></div>
-                <div className="flex-1 overflow-y-auto scrollbar-thin p-0" ref={tableContainerRef}>
+                <div
+                    className="flex-1 overflow-y-auto scrollbar-thin p-0"
+                    ref={tableContainerRef}
+                    onMouseEnter={() => { filesHoverRef.current = true; }}
+                    onMouseLeave={() => { filesHoverRef.current = false; scrollFilesToBottom(); }}
+                >
                     {downloadedFiles.map((file, idx) => (
                         <div key={idx} className={`flex text-[10px] border-b border-slate-800 p-1.5 items-center ${!file.isMatch ? 'bg-amber-900/30' : 'hover:bg-slate-800/50'}`}>
                             <div className="w-6 text-center text-sm">{file.type === 'video' ? '🎬' : '📷'}</div>

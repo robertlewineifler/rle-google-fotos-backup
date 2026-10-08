@@ -18,7 +18,7 @@
 
 
 
-const { app, BrowserWindow, ipcMain, dialog, shell, Menu } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, Menu, powerSaveBlocker } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const fsPromises = require('fs').promises; // NEU: Async FS
@@ -38,6 +38,8 @@ let mainWindow;
 // --- LOGGING & DB-BACKUPS ---
 const DB_BACKUP_MAX = 20;
 let currentDbPath = null;
+// F33: Verhindert Ruhemodus + Bildschirm-Aus während Scan/laufender Downloads
+let powerSaveBlockerId = null;
 
 function getLogDir() {
     const baseDir = currentDbPath ? path.dirname(currentDbPath) : app.getPath('userData');
@@ -426,6 +428,16 @@ app.whenReady().then(() => {
 });
 
 app.on('window-all-closed', function () { if (process.platform !== 'darwin') app.quit(); });
+
+// F33: Blocker beim App-Ende sicher freigeben (Windows gibt ihn ohnehin mit dem Prozess frei)
+app.on('will-quit', function () {
+    try {
+        if (powerSaveBlockerId !== null && powerSaveBlocker.isStarted(powerSaveBlockerId)) {
+            powerSaveBlocker.stop(powerSaveBlockerId);
+        }
+        powerSaveBlockerId = null;
+    } catch (e) { /* best effort */ }
+});
 
 ipcMain.on('log-to-console', (event, message, type = 'info') => {
     const timestamp = new Date().toLocaleTimeString();
@@ -1027,6 +1039,26 @@ ipcMain.handle('prepare-download', async (event, config) => {
 ipcMain.handle('cancel-pending-download', async () => {
     nextDownloadConfig.active = false;
     return true;
+});
+
+// F33: Ruhemodus + Bildschirm-Aus während Scan/laufender Downloads verhindern.
+ipcMain.handle('set-power-save-blocker', async (event, enable) => {
+    try {
+        if (enable) {
+            if (powerSaveBlockerId === null || !powerSaveBlocker.isStarted(powerSaveBlockerId)) {
+                powerSaveBlockerId = powerSaveBlocker.start('prevent-display-sleep');
+                appendLog('info', `Ruhemodus-Schutz aktiviert (Blocker #${powerSaveBlockerId}).`);
+            }
+        } else if (powerSaveBlockerId !== null) {
+            if (powerSaveBlocker.isStarted(powerSaveBlockerId)) powerSaveBlocker.stop(powerSaveBlockerId);
+            powerSaveBlockerId = null;
+            appendLog('info', 'Ruhemodus-Schutz deaktiviert.');
+        }
+        return true;
+    } catch (e) {
+        appendLog('warning', `Power-Save-Blocker fehlgeschlagen: ${e.message}`);
+        return false;
+    }
 });
 
 ipcMain.handle('delete-file', async (event, { basePath, filename, timestamp }) => {

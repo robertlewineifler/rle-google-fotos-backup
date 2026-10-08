@@ -218,6 +218,7 @@ declare global {
       // Download
       prepareDownload: (config: DownloadConfig) => Promise<boolean>;
       cancelPendingDownload: () => Promise<boolean>; // F10: entwertet die offene Download-Config
+      setPowerSaveBlocker: (enable: boolean) => Promise<boolean>; // F33: Ruhemodus/Bildschirm-Aus verhindern
       onDownloadStarted: (callback: (id: string, filename: string) => void) => void; // F11: finaler Dateiname
       onDownloadComplete: (callback: (result: DownloadResult) => void) => void;
       onDownloadProgress: (callback: (progress: DownloadProgress) => void) => void;
